@@ -1,0 +1,4092 @@
+/* ==========================================================================
+   1. SUPABASE (toute la communication avec la base est ici)
+   ========================================================================== */
+
+/* À remplacer par les valeurs de ton projet :
+   Supabase → Project Settings → API (clé "anon" / "publishable" uniquement) */
+const SUPABASE_URL = "https://vclfmojfmwgnkfnnknks.supabase.co";
+const SUPABASE_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InZjbGZtb2pmbXdnbmtmbm5rbmtzIiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImlhdCI6MTc5MjE3MDQwNiwiZXhwIjoyMTA3NzQ2NDA2fQ.nfyoA6m6MZ8Jtnuy6F38u7wqwe27xuzc7JoQUc65z1M";
+
+/* Lus AVANT la création du client : Supabase retire ensuite le fragment de l'adresse.
+   Lien de réinitialisation du mot de passe : « #access_token=…&type=recovery »
+   Lien expiré ou déjà utilisé :               « #error=access_denied&error_code=otp_expired… » */
+let recovering = /[#&]type=recovery/.test(location.hash);
+const AUTH_LINK_ERROR = /[#&]error(_code)?=/.test(location.hash);
+
+const sb = window.supabase.createClient(SUPABASE_URL, SUPABASE_KEY);
+
+sb.auth.onAuthStateChange(event => {
+    if (event === "PASSWORD_RECOVERY") {
+        recovering = true;
+
+        /* Le démarrage a déjà affiché un écran : on bascule sur le nouveau mot de passe */
+        if (typeof render === "function" && view !== "reset" && document.querySelector("#app").innerHTML) {
+            view = "reset";
+            render();
+        }
+    }
+});
+
+/* Renvoie les données d'une réponse Supabase, ou lève l'erreur */
+const check = ({ data, error }) => {
+    if (error) {
+        throw error;
+    }
+    return data;
+};
+
+/* Transforme une erreur technique en message lisible */
+function explain(e) {
+    const text = String((e && e.message) || e);
+
+    if (/invalid login credentials/i.test(text)) {
+        return "Identifiants incorrects.";
+    }
+    if (/already registered/i.test(text)) {
+        return "Cet e-mail est déjà utilisé.";
+    }
+    if (/valid email/i.test(text)) {
+        return "Adresse e-mail invalide.";
+    }
+    if (e && e.code === "23505") {
+        return "Cet enregistrement existe déjà.";
+    }
+    if (/rate limit|only request this after|too many requests/i.test(text)) {
+        return "Trop de demandes : patiente une minute avant de réessayer.";
+    }
+    if (/different from the old password/i.test(text)) {
+        return "Choisis un mot de passe différent de l'ancien.";
+    }
+    if (/password should be at least|weak password/i.test(text)) {
+        return "Mot de passe trop faible (6 caractères minimum).";
+    }
+    if (/anonymous sign-ins are disabled/i.test(text)) {
+        return "Connexion impossible pour le moment : préviens ton professeur.";
+    }
+    if (e && e.code === "42501") {
+        return "Action non autorisée (session expirée, droits insuffisants ou phase changée).";
+    }
+    return text;
+}
+
+/* Mise en forme d'une classe reçue de la base (noms attendus par les vues) */
+function normalize(c) {
+    if (!c) {
+        return null;
+    }
+
+    const cast  = c.cast_votes || 0;
+    const blank = c.blank_votes || 0;
+    const abst  = c.abstentions || 0;
+
+    return {
+        ...c,
+        cast,
+        blank,
+        abst,
+        valid:      cast - blank - abst,        // suffrages exprimés
+        doubleVote: !!c.double_vote,
+        needApproval: !!c.need_approval,
+        round:  c.round || 1,
+        seats:  c.seats || 2,
+        rounds: c.rounds || [],
+        pairs:  (c.pairs || []).sort((a, b) =>
+            String(a.created_at).localeCompare(String(b.created_at)))
+    };
+}
+
+const api = {
+
+    /* --- Session : chaque appareil a au moins une session anonyme ------- */
+
+    async session() {
+        const { data } = await sb.auth.getSession();
+        let session = data.session;
+
+        if (!session) {
+            session = check(await sb.auth.signInAnonymously()).session;
+        }
+        return session.user;
+    },
+
+    async signUp(email, password) {
+        const data = check(await sb.auth.signUp({ email, password }));
+        return data.session ? data.user : null;   // null = e-mail à confirmer
+    },
+
+    async signIn(email, password) {
+        return check(await sb.auth.signInWithPassword({ email, password })).user;
+    },
+
+    async signOut() {
+        await sb.auth.signOut();
+    },
+
+    /* Envoie l'e-mail « mot de passe oublié » (la réponse est identique que le compte existe ou non) */
+    async resetPassword(email) {
+        check(await sb.auth.resetPasswordForEmail(email, {
+            redirectTo: location.origin + location.pathname
+        }));
+    },
+
+    /* Définit le nouveau mot de passe (session de récupération ou professeur connecté) */
+    async updatePassword(password) {
+        return check(await sb.auth.updateUser({ password })).user;
+    },
+
+    /* Utilisateur connecté (e-mail du professeur) */
+    async currentUser() {
+        const { data } = await sb.auth.getSession();
+        return data.session ? data.session.user : null;
+    },
+
+    /* Supprime le compte du professeur et toutes ses données (voir migration_v7.sql) */
+    async deleteAccount() {
+        check(await sb.rpc("delete_my_account"));
+
+        /* Le compte n'existe plus : on efface seulement la session locale */
+        await sb.auth.signOut({ scope: "local" });
+    },
+
+
+    /* --- Classes -------------------------------------------------------- */
+
+    async getClass(code) {
+        return normalize(check(
+            await sb.from("classes")
+                .select("*, pairs(*)")
+                .eq("code", code)
+                .maybeSingle()
+        ));
+    },
+
+    async myClasses(ownerId) {
+        const list = check(
+            await sb.from("classes")
+                .select("*, pairs(id)")
+                .eq("owner", ownerId)
+                .order("created_at", { ascending: false })
+        );
+        return list.map(normalize);
+    },
+
+    /* Crée la classe avec un code unique à 6 chiffres (nouvel essai si doublon) */
+    async createClass(name, n, doubleVote, needApproval) {
+        for (let i = 0; i < 5; i++) {
+            const code = String(Math.floor(100000 + Math.random() * 900000));
+            const { error } = await sb.from("classes").insert({
+                code, name, n,
+                double_vote: !!doubleVote,
+                need_approval: !!needApproval
+            });
+
+            if (!error) {
+                return code;
+            }
+            if (error.code !== "23505") {
+                throw error;
+            }
+        }
+        throw new Error("Impossible de générer un code unique, réessaie.");
+    },
+
+    async setPhase(code, phase) {
+        const rows = check(
+            await sb.from("classes")
+                .update({ phase })
+                .eq("code", code)
+                .select("code")
+        );
+
+        /* Sans cette vérification, un refus RLS ne renvoie aucune erreur */
+        if (!rows || !rows.length) {
+            throw new Error("La phase n'a pas pu être modifiée (droits insuffisants ou classe introuvable).");
+        }
+    },
+
+    /* Validation des élèves par le professeur (voir migration_v4.sql) */
+
+    /* Élève : envoie son prénom/pseudo au professeur */
+    async requestAccess(code, pseudo) {
+        return check(await sb.rpc("request_access", { p_class: code, p_pseudo: pseudo }));
+    },
+
+    /* Élève : où en est ma demande ? (le pseudo n'est visible que tant qu'elle est en attente) */
+    async myAccess(code) {
+        const rows = check(
+            await sb.from("voter_access")
+                .select("status, pseudo")
+                .eq("class_code", code)
+                .eq("voter_id", me)
+                .limit(1)
+        );
+        return rows && rows[0] ? rows[0] : { status: "none", pseudo: null };
+    },
+
+    /* Professeur : toutes les demandes de sa classe */
+    async accessRows(code) {
+        return check(
+            await sb.from("voter_access")
+                .select("voter_id, status, pseudo, created_at")
+                .eq("class_code", code)
+                .order("created_at")
+        );
+    },
+
+    /* Professeur : valide (true) ou refuse / retire (false) */
+    async decideAccess(code, voterId, approve) {
+        check(await sb.rpc("decide_access", { p_class: code, p_voter: voterId, p_approve: approve }));
+    },
+
+      async deleteClass(code) {
+          const rows = check(await sb.from("classes").delete().eq("code", code).select("code"));
+          if (!rows.length) {
+              throw new Error("Suppression refusée : connecte-toi avec ton compte professeur.");
+          }
+      },
+
+
+    /* --- Binômes -------------------------------------------------------- */
+
+    async addPair(code, t, r, prog) {
+        check(await sb.from("pairs").insert({ class_code: code, t, r, prog }));
+    },
+
+    async removePair(id) {
+        const rows = check(await sb.from("pairs").delete().eq("id", id).select("id"));
+
+        /* Sans cette vérification, un refus RLS (phase changée) ne renvoie aucune erreur */
+        if (!rows || !rows.length) {
+            throw new Error("Retrait impossible : la phase de candidature est peut-être terminée.");
+        }
+    },
+
+
+    /* --- Vote ----------------------------------------------------------- */
+
+    /* Cet appareil a-t-il déjà voté DANS LE TOUR EN COURS ? (voir migration.sql) */
+    async hasVoted(code) {
+        return !!check(await sb.rpc("has_voted", { p_class: code }));
+    },
+
+    /* Bulletin atomique côté serveur (voir migration_v4.sql).
+       kind : "pair" (1 ou 2 binômes), "blank" (vote blanc) ou "abstain" (abstention) */
+    async castBallot(code, kind, pairIds) {
+        check(await sb.rpc("cast_ballot", {
+            p_class: code,
+            p_kind:  kind,
+            p_pairs: pairIds
+        }));
+    },
+
+    /* Professeur : clôture le tour en cours (majorité absolue → binôme élu) */
+    async closeRound(code) {
+        return check(await sb.rpc("close_round", { p_class: code }));
+    }
+};
+
+
+/* ==========================================================================
+   2. ÉTAT DE L'APPLICATION Emerick
+   ========================================================================== */
+
+let me   = null;     // identifiant (auth) de cet appareil ou du professeur
+let view = "home";   // écran affiché
+let cur  = null;     // code de la classe ouverte
+let prof = null;     // identifiant du professeur connecté (null = élève)
+let msg  = "";       // message d'erreur à afficher au prochain rendu
+let profEmail = "";  // adresse e-mail du professeur connecté (écran « Mon compte »)
+
+let cls       = null;   // classe ouverte (avec ses binômes)
+let voted     = false;  // cet appareil a-t-il déjà voté dans cette classe ?
+let myClasses = [];     // classes du professeur connecté
+let access    = [];     // demandes d'accès des élèves (professeur)
+let myAccess  = { status: "none", pseudo: null };   // ma propre demande (élève)
+
+let picked    = [];     // binôme(s) sélectionné(s) sur le bulletin en cours
+let pickedKey = "";     // « classe|tour » auquel correspond la sélection
+
+let polling = false;    // un rafraîchissement automatique est-il en cours ?
+let again   = false;    // un changement est arrivé pendant ce rafraîchissement
+let lastDashSig = "";   // « empreinte » du tableau de bord affiché
+let rt      = { key: "", channel: null };   // abonnement temps réel en cours
+let rtCount = 0;
+let lastSig = "";       // « empreinte » de la dernière classe affichée
+
+const POLL_MS    = 5000;                                   // filet de sécurité si le temps réel décroche
+const POLL_VIEWS = ["role", "cand", "vote", "res", "live"];  // écrans mis à jour tout seuls
+
+const PHASES = {
+    cand: "Candidatures",
+    vote: "Vote",
+    res:  "Résultats"
+};
+
+
+/* ==========================================================================
+   3. UTILITAIRES Enzo
+   ========================================================================== */
+
+const $ = selector => document.querySelector(selector);
+
+const C = () => cls;
+
+/* Échappe le HTML pour éviter l'injection de code */
+const esc = s => String(s).replace(/[&<>"']/g, c => ({
+    "&": "&amp;",
+    "<": "&lt;",
+    ">": "&gt;",
+    '"': "&quot;",
+    "'": "&#39;"
+}[c]));
+
+/* Écrans qui ont besoin de la classe ouverte */
+const CLASS_VIEWS = ["role", "cand", "vote", "res", "live", "dossier"];
+
+/* Minuscules sans accents : « Léo » et « leo » sont le même prénom */
+const fold = s => String(s || "")
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .trim()
+    .toLowerCase();
+
+/* Élèves validés, mémorisés UNIQUEMENT sur l'appareil du professeur (jamais en base) :
+   ils servent à repérer un doublon (même prénom qui se représente en navigation privée)
+   et à retirer un accès validé par erreur. */
+function loadApproved(k) {
+    try {
+        return JSON.parse(localStorage.getItem("approved:" + k) || "[]");
+    } catch (e) {
+        return [];
+    }
+}
+
+function saveApproved(k, list) {
+    try {
+        localStorage.setItem("approved:" + k, JSON.stringify(list));
+    } catch (e) { /* stockage indisponible : on perd seulement la détection de doublons */ }
+}
+
+/* S'assure que cet appareil a une session (nouvel essai si le démarrage a échoué) */
+async function ensureMe() {
+    if (!me) {
+        me = (await api.session()).id;
+    }
+    return me;
+}
+
+/* Charge depuis Supabase les données dont l'écran courant a besoin */
+async function refresh() {
+    if (view === "account") {
+        const user = await api.currentUser();
+        profEmail = user && user.email ? user.email : "";
+        return;
+    }
+
+    if (view === "dash") {
+        myClasses = await api.myClasses(prof);
+        watchAccessFromDash(myClasses);
+        return;
+    }
+
+    if (CLASS_VIEWS.includes(view)) {
+        await ensureMe();
+        cls = await api.getClass(cur);
+
+        if (!cls) {
+            view = "home";
+            cur  = null;
+            throw new Error("Cette élection n'existe plus.");
+        }
+
+        if (view === "vote") {
+            voted    = await api.hasVoted(cur);
+            myAccess = cls.needApproval ? await api.myAccess(cur) : { status: "none", pseudo: null };
+        }
+
+        if (view === "live" && prof && cls.needApproval) {
+            access = await api.accessRows(cur);
+            notifyAccess(cur, access);
+        }
+
+        if (view === "dossier") {
+            if (!prof) {
+                throw new Error("Réservé au professeur.");
+            }
+            acts    = await api.acts(cur);
+            minutes = await api.minutes(cur);
+        }
+    }
+}
+
+/* Change d'écran (en rechargeant les données), avec un message optionnel */
+async function go(v, m) {
+    view = v;
+    msg  = m || "";
+
+    if (location.hash.startsWith("#/")) {
+        history.replaceState(null, "", location.pathname + location.search);
+    }
+
+    try {
+        await refresh();
+    } catch (e) {
+        msg = explain(e);
+
+        /* Pas de données fiables pour cet écran : retour à l'accueil
+           plutôt qu'un affichage cassé ou la classe d'un autre code */
+        if (CLASS_VIEWS.includes(view) && (!cls || cls.code !== cur)) {
+            cls  = null;
+            view = "home";
+        }
+    }
+
+    render();
+}
+
+/* Boîte de confirmation du site (remplace le confirm() du navigateur).
+   Renvoie une promesse : true si l'utilisateur confirme, false sinon.
+   options : { title, ok, cancel, danger } */
+let dialogOpen = null;
+
+function askConfirm(text, options = {}) {
+    const { title = "Confirmation", ok = "Confirmer", cancel = "Annuler", danger = false } = options;
+
+    /* Une seule boîte à la fois : l'ancienne est annulée */
+    if (dialogOpen) {
+        dialogOpen(false);
+    }
+
+    return new Promise(resolve => {
+        const previous = document.activeElement;
+        const root = document.createElement("div");
+
+        root.className = "dialog-backdrop";
+        root.innerHTML = `
+            <div class="dialog" role="alertdialog" aria-modal="true"
+                 aria-labelledby="dialog-title" aria-describedby="dialog-text">
+                <h2 id="dialog-title">${esc(title)}</h2>
+                <p id="dialog-text">${esc(text)}</p>
+                <div class="row dialog-actions">
+                    <button type="button" data-act="cancel">${esc(cancel)}</button>
+                    <button type="button" data-act="ok" class="${danger ? "danger" : "go"}">${esc(ok)}</button>
+                </div>
+            </div>`;
+
+        const okBtn     = root.querySelector('[data-act="ok"]');
+        const cancelBtn = root.querySelector('[data-act="cancel"]');
+
+        const close = value => {
+            document.removeEventListener("keydown", onKey, true);
+            root.remove();
+            document.body.classList.remove("dialog-lock");
+            dialogOpen = null;
+
+            if (previous && typeof previous.focus === "function") {
+                previous.focus();
+            }
+            resolve(value);
+        };
+
+        const onKey = e => {
+            if (e.key === "Escape") {
+                e.preventDefault();
+                close(false);
+            } else if (e.key === "Tab") {
+                /* Le focus reste dans la boîte */
+                const items = [cancelBtn, okBtn];
+                const i = items.indexOf(document.activeElement);
+
+                e.preventDefault();
+                items[(i + (e.shiftKey ? items.length - 1 : 1)) % items.length].focus();
+            }
+        };
+
+        okBtn.addEventListener("click", () => close(true));
+        cancelBtn.addEventListener("click", () => close(false));
+        root.addEventListener("mousedown", e => {
+            if (e.target === root) {
+                close(false);
+            }
+        });
+
+        dialogOpen = close;
+        document.addEventListener("keydown", onKey, true);
+        document.body.classList.add("dialog-lock");
+        document.body.appendChild(root);
+
+        /* Action destructive : le focus démarre sur « Annuler » */
+        (danger ? cancelBtn : okBtn).focus();
+    });
+}
+
+/* Affiche une erreur sans refaire tout le rendu */
+function err(m) {
+    const el = $("#msg");
+
+    if (el) {
+        el.classList.remove("ok");
+        el.textContent = m;
+    }
+}
+
+/* Affiche une information positive (en vert) */
+function info(m) {
+    const el = $("#msg");
+
+    if (el) {
+        el.classList.add("ok");
+        el.textContent = m;
+    }
+}
+
+
+/* ==========================================================================
+   4. LOGIQUE MÉTIER Enzo
+   ========================================================================== */
+
+/* Classe des binômes par voix ; les ex æquo partagent le même rang */
+function rank(pairs) {
+    const list = pairs
+        .map(x => ({ ...x }))
+        .sort((a, b) => b.votes - a.votes);
+
+    list.forEach((x, i) => {
+        const tiedWithPrevious = i && x.votes === list[i - 1].votes;
+        x.rk = tiedWithPrevious ? list[i - 1].rk : i + 1;
+    });
+
+    return list;
+}
+
+/* Binômes déjà élus, dans l'ordre (binôme n°1, binôme n°2…) */
+const electedPairs = c => c.pairs
+    .filter(x => x.seat != null)
+    .sort((a, b) => a.seat - b.seat);
+
+/* Binômes encore en lice */
+const runningPairs = c => c.pairs.filter(x => x.seat == null);
+
+/* Majorité absolue des suffrages exprimés (hors blancs et abstentions) */
+const majorityNeeded = c => Math.floor(c.valid / 2) + 1;
+
+/* Nombre de sièges pourvus dans le tour en cours : 2 si l'option « 2 binômes » est active */
+function slotsOf(c) {
+    const left = c.seats - electedPairs(c).length;
+    return c.doubleVote ? Math.max(1, Math.min(2, left)) : 1;
+}
+
+/* Nombre MAXIMUM de binômes cochables sur le bulletin (même règle que le serveur) :
+   l'élève en choisit de 1 jusqu'à ce maximum */
+const ballotPicks = c => Math.min(slotsOf(c), runningPairs(c).length);
+
+/* « du binôme n°1 » / « des binômes n°1 et n°2 » */
+function seatLabel(c) {
+    const first = electedPairs(c).length + 1;
+
+    return slotsOf(c) > 1
+        ? `des binômes n°${first} et n°${first + 1}`
+        : `du binôme n°${first}`;
+}
+
+/* Élus d'un tour archivé (compatible avec les anciens tours à un seul élu) */
+const roundWinners = h => h.winners || (h.winner ? [{ id: h.winner, seat: h.seat }] : []);
+
+/* Pourcentage (entier) de voix */
+const percent = (votes, total) => total ? Math.round(votes / total * 100) : 0;
+
+/* Empreinte de ce qui est affiché : on ne redessine que si elle change */
+function signature(c, hasVoted) {
+    const withVotes = view === "live";
+
+    return JSON.stringify([
+        c.phase, c.round, c.rounds.length, hasVoted, myAccess.status,
+        withVotes ? [c.cast, c.blank, c.abst, access.map(a => [a.voter_id, a.status, a.pseudo])] : 0,
+        c.pairs.map(x => [x.id, x.t, x.r, x.prog, x.seat, withVotes ? x.votes : 0])
+    ]);
+}
+
+
+/* ==========================================================================
+   5. VUES (chaque fonction renvoie le HTML d'un écran) Emerick + Enzo
+   ========================================================================== */
+
+/* --- 5.1 Éléments réutilisables -------------------------------------- */
+
+/* selected : undefined = pas de bouton ; true/false = bouton « choisir » (écran de vote) */
+function pairHTML(x, selected) {
+    const electedTag = x.seat != null
+        ? `<span class="tag win">Binôme n°${x.seat} élu</span>`
+        : "";
+
+    const program = x.prog
+        ? `<p>${esc(x.prog)}</p>`
+        : "";
+
+    const voteButton = selected === undefined
+        ? ""
+        : `<button class="${selected ? "go" : ""}" aria-pressed="${selected}" onclick="pick('${x.id}')">${selected ? "✓ Binôme choisi" : "Choisir ce binôme"}</button>`;
+
+    return `
+        <div class="box${selected ? " picked" : ""}">
+            <h2>${esc(x.t)} &amp; ${esc(x.r)}</h2>
+            ${electedTag}
+            <p class="muted">Titulaire : ${esc(x.t)} · Remplaçant : ${esc(x.r)}</p>
+            ${program}
+            ${voteButton}
+        </div>`;
+}
+
+function classCardHTML(c) {
+    const k = c.code;
+
+    const digits = [...k]
+        .map(d => `<span>${d}</span>`)
+        .join("");
+
+    /* Sélecteur de phase : la phase courante est mise en avant */
+    const seg = Object.keys(PHASES)
+        .map(p => `<button type="button" aria-pressed="${c.phase === p}" onclick="phase('${k}','${p}')">${PHASES[p]}</button>`)
+        .join("");
+
+    const tags = `
+        <span class="tag">${PHASES[c.phase]}</span>
+        ${c.doubleVote ? `<span class="tag">2 binômes</span>` : ""}
+        ${c.needApproval ? `<span class="tag">Validation des élèves</span>` : ""}`;
+
+    return `
+        <section class="box class-card">
+
+            <div class="row between top">
+                <div class="grow">
+                    <h2>${esc(c.name)}</h2>
+                    <div class="row tags">${tags}</div>
+                </div>
+                <div class="code" aria-label="Code ${k}">${digits}</div>
+            </div>
+
+            <div class="stats">
+                <div class="stat"><b>${c.n}</b><span>élèves</span></div>
+                <div class="stat"><b>${c.pairs.length}</b><span>binôme(s)</span></div>
+                <div class="stat"><b>${c.cast}<small>/${c.n}</small></b><span>votes · tour ${c.round}</span></div>
+            </div>
+
+            <div class="field-group">
+                <span class="small muted" id="ph-${k}">Phase de l'élection</span>
+                <div class="seg" role="group" aria-labelledby="ph-${k}">${seg}</div>
+            </div>
+
+            <div class="card-actions">
+                <button class="go" onclick="showLive('${k}')">Suivre en direct</button>
+                <button onclick="showQr('${k}')">QR code</button>
+                <button onclick="openDossier('${k}')">Dossier PDF</button>
+                <button class="danger spacer" onclick="del('${k}')">Supprimer</button>
+            </div>
+
+        </section>`;
+}
+
+/* Une ligne de résultat avec sa barre (le trait central = majorité à 50 %) */
+function barRowHTML(x, total, winners) {
+    const pct   = percent(x.votes, total);
+    const crown = [].concat(winners || []).includes(x.id) ? " 🏆" : "";
+
+    return `
+        <div class="bar-row">
+            <div class="row between">
+                <b>${esc(x.t)} &amp; ${esc(x.r)}${crown}</b>
+                <span>${x.votes} voix · ${pct} %</span>
+            </div>
+            <div class="bar" aria-hidden="true"><i style="width:${pct}%"></i></div>
+        </div>`;
+}
+
+/* Ligne « blancs / abstentions » sous un décompte */
+function ballotsLine(valid, blank, abst) {
+    return `${valid} suffrage(s) exprimé(s) · ${blank} blanc(s) · ${abst} abstention(s)`;
+}
+
+/* Bilan d'un tour terminé (archivé par le serveur) */
+function roundHTML(h) {
+    const winners = roundWinners(h);
+    const valid   = h.valid ?? h.cast;          // anciens tours : pas de blancs
+    const blank   = h.blank || 0;
+    const abst    = h.abstain || 0;
+
+    const rows = (h.results || [])
+        .map(x => barRowHTML(x, valid, winners.map(w => w.id)))
+        .join("");
+
+    const seats = winners.map(w => `n°${w.seat}`).join(" et ");
+
+    const outcome = winners.length
+        ? `${winners.length > 1 ? "Binômes" : "Binôme"} ${seats} élu${winners.length > 1 ? "s" : ""} à la majorité absolue.`
+        : `Aucune majorité absolue : nouveau tour.`;
+
+    const target = (h.slots || 1) > 1
+        ? `Élection des binômes n°${h.seat} et n°${h.seat + 1}`
+        : `Élection du binôme n°${h.seat}`;
+
+    return `
+        <div class="box">
+            <h2>Tour ${h.round}</h2>
+            <p class="muted">${target} · ${h.cast} bulletin(s) sur ${h.n} élèves</p>
+            <p class="muted">${ballotsLine(valid, blank, abst)}</p>
+            ${rows}
+            <p class="notice">${outcome}</p>
+        </div>`;
+}
+
+/* Rappel du dernier tour, affiché aux élèves pendant le vote */
+function lastRoundNotice(c) {
+    const h = c.rounds[c.rounds.length - 1];
+
+    if (!h) {
+        return "";
+    }
+
+    const names = roundWinners(h)
+        .map(w => {
+            const x = (h.results || []).find(r => r.id === w.id);
+            return x ? `${esc(x.t)} &amp; ${esc(x.r)} (n°${w.seat})` : "";
+        })
+        .filter(Boolean);
+
+    const text = names.length
+        ? `Tour ${h.round} : ${names.join(" et ")} ${names.length > 1 ? "élus" : "élu"} !`
+        : `Tour ${h.round} : aucune majorité absolue, on recommence.`;
+
+    return `<p class="notice">${text}</p>`;
+}
+
+
+/* --- 5.2 Écrans élève ------------------------------------------------ */
+
+function viewHome(m) {
+    return `
+        <form class="box narrow" onsubmit="event.preventDefault(); joinCode()">
+
+            <span class="brand-logo big" aria-hidden="true"></span>
+            <h1>Élection des délégués</h1>
+            <p class="muted">Entre le code donné par ton professeur.</p>
+
+            <input id="code" class="code-in"
+                   inputmode="numeric" pattern="[0-9]*" maxlength="6"
+                   autocomplete="off" placeholder="000000"
+                   aria-label="Code à 6 chiffres">
+
+            ${m}
+
+            <button class="go">Valider</button>
+            <button type="button" class="link" onclick="go(prof ? 'dash' : 'plogin')">Espace professeur</button>
+
+        </form>`;
+}
+
+function viewRole(m) {
+    const c = C();
+
+    return `
+        <h1>Classe ${esc(c.name)}</h1>
+        <p class="muted">Phase en cours : ${PHASES[c.phase]}</p>
+
+        <div class="hero">
+            <button class="e" onclick="voteAccess()">Électeur</button>
+            <button class="c" onclick="go('cand')">Candidat</button>
+        </div>
+
+        ${m}
+
+        <div class="row">
+            <button class="link" onclick="go('home')">← Changer de code</button>
+        </div>`;
+}
+
+function viewCandidate(m) {
+    const c      = C();
+    const mine   = c.pairs.find(x => x.owner === me);
+    const others = c.pairs.filter(x => x.owner !== me);
+
+    /* Colonne de gauche : ma candidature ou le formulaire */
+    let left;
+
+    if (mine) {
+        const withdrawButton = c.phase === "cand"
+            ? `<button class="danger" onclick="unapply('${mine.id}')">Retirer ma candidature</button>`
+            : "";
+
+        left = `
+            <div class="box">
+                <h2>Ton binôme</h2>
+                <p>✅ ${esc(mine.t)} (titulaire) &amp; ${esc(mine.r)} (remplaçant)</p>
+                ${withdrawButton}
+                ${m}
+            </div>`;
+    } else if (c.phase !== "cand") {
+        left = `
+            <div class="box">
+                <h2>Candidatures closes</h2>
+                <p class="muted">La phase de candidature est terminée : tu peux consulter les binômes.</p>
+                ${m}
+            </div>`;
+    } else {
+        left = `
+            <form class="box" onsubmit="event.preventDefault(); apply()">
+                <h2>Se présenter en binôme</h2>
+
+                <p class="muted small">Ces réponses remplissent ton acte de candidature, lu uniquement par ton professeur.
+                    La classe ne voit que les prénoms et le programme.</p>
+
+                <div class="row">
+                    <input id="nt" placeholder="Prénom du titulaire" aria-label="Prénom du titulaire" maxlength="40" style="flex:1">
+                    <input id="ntn" placeholder="Nom du titulaire" aria-label="Nom du titulaire" maxlength="40" style="flex:1">
+                </div>
+                <div class="row">
+                    <input id="nr" placeholder="Prénom du suppléant" aria-label="Prénom du suppléant" maxlength="40" style="flex:1">
+                    <input id="nrn" placeholder="Nom du suppléant" aria-label="Nom du suppléant" maxlength="40" style="flex:1">
+                </div>
+                <textarea id="pres" placeholder="Présentez-vous brièvement (nom, âge, qualités)"
+                          aria-label="Présentation" maxlength="400"></textarea>
+                <textarea id="mot" placeholder="Vos motivations (pourquoi candidater, comment le titulaire a choisi son suppléant)"
+                          aria-label="Motivations" maxlength="600"></textarea>
+                <textarea id="pg" placeholder="Votre programme (rôle auprès de la classe, des professeurs, de l'administration, vos projets)"
+                          aria-label="Programme" maxlength="800"></textarea>
+                <input id="slo" placeholder="Votre slogan" aria-label="Slogan" maxlength="120">
+
+                ${m}
+
+                <button class="go">Candidater</button>
+            </form>`;
+    }
+
+    /* Colonne de droite : les autres binômes */
+    const othersHTML = others.map(x => pairHTML(x)).join("")
+        || `<p class="muted">Aucun autre binôme pour l'instant.</p>`;
+
+    return `
+        <h1>Page candidat</h1>
+
+        <div class="split">
+            <div>
+                ${left}
+            </div>
+            <div>
+                <h2>Autres binômes</h2>
+                <div class="grid" style="margin-top:12px">${othersHTML}</div>
+            </div>
+        </div>
+
+        <button class="link" onclick="go('role')">← Retour</button>`;
+}
+
+function viewVoter(m) {
+    const c       = C();
+    const elected = electedPairs(c);
+    const running = runningPairs(c);
+    const picks   = ballotPicks(c);
+
+    /* La sélection ne vaut que pour la classe et le tour affichés */
+    const key = c.code + "|" + c.round;
+
+    if (pickedKey !== key) {
+        pickedKey = key;
+        picked    = [];
+    }
+    picked = picked.filter(id => running.some(x => x.id === id));
+
+    /* Validation par le professeur : sans elle, pas de bulletin */
+    const accessOK = !c.needApproval || myAccess.status === "approved";
+    const waiting  = c.needApproval && myAccess.status === "pending";
+    const showForm = c.needApproval && !accessOK && !waiting && c.phase !== "res";
+    const canVote  = !voted && c.phase === "vote" && accessOK;
+
+    /* Message d'état : il change tout seul avec la phase et le tour */
+    let status;
+
+    if (c.phase === "cand") {
+        status = `<p class="notice">Les candidatures sont ouvertes : les binômes apparaissent ici au fur et à mesure. Le vote s'ouvrira bientôt.</p>`;
+    } else if (voted) {
+        status = `<p class="notice">Ton bulletin est enregistré pour ce tour ✅ Attends la fin du tour…</p>`;
+    } else {
+        const choose = picks > 1 ? " Tu peux choisir 1 ou 2 binômes." : "";
+
+        status = `<p class="notice">Tour ${c.round} : élection ${seatLabel(c)} sur ${c.seats}. Il faut la majorité absolue des votes.${choose}</p>`;
+    }
+
+    /* Accès au vote : demande au professeur */
+    let accessHTML = "";
+
+    if (waiting) {
+        accessHTML = `<p class="notice">⏳ En attente de validation par ton professeur…</p>`;
+    } else if (showForm) {
+        const refused = myAccess.status === "refused"
+            ? `<p class="notice">Demande refusée par ton professeur.</p>`
+            : "";
+
+        accessHTML = `
+            ${refused}
+            <form class="box" onsubmit="event.preventDefault(); requestAccess()">
+                <h2>Accès au vote</h2>
+                <input id="pseudo" maxlength="40" autocomplete="off"
+                       placeholder="Ton prénom ou pseudo" aria-label="Ton prénom ou pseudo">
+                ${m}
+                <button class="go">Demander l'accès</button>
+            </form>`;
+    }
+
+    const electedHTML = elected.length
+        ? `<h2>Déjà élus</h2><div class="grid">${elected.map(x => pairHTML(x)).join("")}</div>`
+        : "";
+
+    const pairs = running
+        .map(x => pairHTML(x, canVote ? picked.includes(x.id) : undefined))
+        .join("")
+        || `<p class="muted">Aucun binôme candidat pour l'instant.</p>`;
+
+    /* Bulletin : validation, vote blanc, abstention */
+    const ready = picks > 0 && picked.length >= 1 && picked.length <= picks;
+
+    const ballotBox = canVote
+        ? `<div class="box ballot">
+               <h2>Ton bulletin</h2>
+               <p class="muted">${picks > 0
+                   ? `${picked.length} / ${picks} choisi(s)`
+                   : "Aucun binôme en lice."}</p>
+               ${m}
+               <button class="go" onclick="ballot('pair')" ${ready ? "" : "disabled"}>Valider mon vote</button>
+               <div class="row">
+                   <button onclick="ballot('blank')">Voter blanc</button>
+                   <button onclick="ballot('abstain')">M'abstenir</button>
+               </div>
+           </div>`
+        : "";
+
+    return `
+        <h1>Page électeur</h1>
+        <p class="muted">Un vote par tour, anonyme et définitif.</p>
+
+        ${c.phase === "vote" ? lastRoundNotice(c) : ""}
+        ${status}
+        ${canVote || showForm ? "" : m}
+        ${accessHTML}
+
+        ${electedHTML}
+
+        <h2>Binômes en lice</h2>
+        <div class="grid">${pairs}</div>
+
+        ${ballotBox}
+
+        <button class="link" onclick="go('role')">← Retour</button>`;
+}
+
+
+/* --- 5.3 Écrans professeur ------------------------------------------- */
+
+function viewTeacherLogin(m) {
+    return `
+        <form class="box narrow" onsubmit="event.preventDefault(); plogin()">
+
+            <h1>Espace professeur</h1>
+            <p class="muted">Connecte-toi, ou crée ton compte.</p>
+
+            <input id="pid" type="email" autocomplete="email"
+                   placeholder="Adresse e-mail" aria-label="Adresse e-mail">
+            <input id="pmdp" type="password" autocomplete="current-password"
+                   placeholder="Mot de passe (6 caractères min.)" aria-label="Mot de passe">
+
+            ${m}
+
+            <button class="go">Se connecter</button>
+            <button type="button" onclick="plogin(true)">Créer le compte</button>
+            <button type="button" class="link" onclick="forgot()">Mot de passe oublié ?</button>
+            <button type="button" class="link" onclick="go('home')">← Retour élève</button>
+
+        </form>`;
+}
+
+function viewReset(m) {
+    return `
+        <form class="box narrow" onsubmit="event.preventDefault(); savePassword()">
+
+            <h1>Nouveau mot de passe</h1>
+            <p class="muted">Choisis un nouveau mot de passe pour ton compte professeur.</p>
+
+            <input id="np1" type="password" autocomplete="new-password"
+                   placeholder="Nouveau mot de passe (6 caractères min.)" aria-label="Nouveau mot de passe">
+            <input id="np2" type="password" autocomplete="new-password"
+                   placeholder="Confirme le mot de passe" aria-label="Confirmation du mot de passe">
+
+            ${m}
+
+            <button class="go">Enregistrer</button>
+            <button type="button" class="link" onclick="recovering = false; go('dash')">Plus tard</button>
+
+        </form>`;
+}
+
+function viewAccount(m) {
+    if (!prof) {
+        return viewTeacherLogin(m);
+    }
+
+    return `
+        <div class="row between">
+            <h1>Mon compte</h1>
+            <button class="link" onclick="go('dash')">← Retour</button>
+        </div>
+
+        <div class="box">
+            <h2>Adresse e-mail</h2>
+            <p>${esc(profEmail)}</p>
+        </div>
+
+        <form class="box" onsubmit="event.preventDefault(); deleteAccount()">
+            <h2>Supprimer mon compte</h2>
+            <p class="muted">Ton compte, tes élections, leurs résultats, les actes de candidature et les
+               procès-verbaux seront supprimés définitivement. Télécharge ce dont tu as besoin avant.</p>
+
+            <input id="dpw" type="password" autocomplete="current-password"
+                   placeholder="Ton mot de passe, pour confirmer" aria-label="Mot de passe">
+
+            ${m}
+
+            <button class="danger">Supprimer mon compte</button>
+        </form>`;
+}
+
+function viewDashboard(m) {
+    const cards = myClasses.map(classCardHTML).join("")
+        || `<div class="empty">Aucune élection pour l'instant. Crée la première ci-dessus.</div>`;
+
+    /* Une seule élection en cours à la fois */
+    const active = myClasses.some(c => c.phase !== "res");
+
+    const newForm = active ? `
+        <div class="notice">Une élection est déjà en cours : publie ses résultats pour pouvoir en créer une nouvelle.</div>
+        ${m}` : `
+        <form class="box new-election" onsubmit="event.preventDefault(); newClass()">
+            <h2>Nouvelle élection</h2>
+
+            <div class="fields">
+                <label class="fld">
+                    <span class="small muted">Classe</span>
+                    <input id="cn" placeholder="ex : 3B" maxlength="40">
+                </label>
+                <label class="fld">
+                    <span class="small muted">Nombre d'élèves</span>
+                    <input id="nb" type="number" min="1" placeholder="ex : 28">
+                </label>
+            </div>
+
+            <div class="opts">
+                <label class="opt">
+                    <input type="checkbox" id="dbl">
+                    <span><b>Vote pour 1 ou 2 binômes</b><br>
+                          <span class="small muted">Chaque élève peut choisir jusqu'à 2 binômes sur son bulletin.</span></span>
+                </label>
+
+                <label class="opt">
+                    <input type="checkbox" id="cod" checked>
+                    <span><b>Valider les élèves un par un</b><br>
+                          <span class="small muted">Tu approuves chaque élève avant qu'il puisse voter.</span></span>
+                </label>
+            </div>
+
+            ${m}
+
+            <button class="go">Générer le code</button>
+        </form>`;
+
+    return `
+        <div class="row between">
+            <h1>Espace professeur</h1>
+            <div class="row">
+                <button class="link" onclick="go('account')">Mon compte</button>
+                <button class="link" onclick="logout()">Déconnexion</button>
+            </div>
+        </div>
+
+        ${newForm}
+
+        <h2 class="section-title">Mes élections</h2>
+        <div class="stack">${cards}</div>`;
+}
+
+
+/* --- 5.4 Direct (professeur) et résultats ---------------------------- */
+
+/* Demandes d'accès à valider (professeur) */
+function accessBoxHTML(c) {
+    if (!c.needApproval) {
+        return "";
+    }
+
+    const known    = loadApproved(c.code);
+    const pending  = access.filter(a => a.status === "pending");
+    const approved = access.filter(a => a.status === "approved").length;
+
+    /* Prénoms déjà vus : validés sur cet appareil + autres demandes en attente */
+    const count = {};
+    known.forEach(k => { count[fold(k.pseudo)] = (count[fold(k.pseudo)] || 0) + 1; });
+    pending.forEach(a => { count[fold(a.pseudo)] = (count[fold(a.pseudo)] || 0) + 1; });
+
+    const rows = pending.map(a => {
+        const dup = count[fold(a.pseudo)] > 1
+            ? ` <span class="tag warn">⚠ doublon possible</span>`
+            : "";
+
+        return `
+            <div class="row between access-row">
+                <span><b>${esc(a.pseudo)}</b>${dup}</span>
+                <span class="row">
+                    <button class="go" onclick="decide('${a.voter_id}', true)">Valider</button>
+                    <button class="danger" onclick="decide('${a.voter_id}', false)">Refuser</button>
+                </span>
+            </div>`;
+    }).join("") || `<p class="muted">Aucune demande en attente.</p>`;
+
+    const knownHTML = known.length
+        ? `<p class="muted small">Validés :</p>
+           ${known.map(k => `
+               <div class="row between access-row">
+                   <span>${esc(k.pseudo)}</span>
+                   <button class="link" onclick="decide('${k.id}', false)">Retirer</button>
+               </div>`).join("")}`
+        : "";
+
+    return `
+        <div class="box">
+            <div class="row between">
+                <h2>Élèves à valider</h2>
+                <span>${approved} validé(s) / ${c.n}</span>
+            </div>
+            ${rows}
+            ${knownHTML}
+        </div>`;
+}
+
+
+function viewLive(m) {
+    const c       = C();
+    const elected = electedPairs(c);
+    const running = rank(runningPairs(c));
+    const needed  = majorityNeeded(c);
+
+    /* Binômes qui dépassent la moitié des suffrages exprimés */
+    const qualified = c.valid > 0
+        ? running.filter(x => x.votes >= needed).map(x => x.id)
+        : [];
+
+    const rows = running.map(x => barRowHTML(x, c.valid, qualified)).join("")
+        || `<p class="muted">Aucun binôme en lice.</p>`;
+
+    const electedHTML = elected.length
+        ? `<div class="box">
+               <h2>Déjà élus</h2>
+               ${elected.map(x => `<p><span class="tag win">Binôme n°${x.seat}</span> <b>${esc(x.t)} &amp; ${esc(x.r)}</b></p>`).join("")}
+           </div>`
+        : "";
+
+    let verdict;
+
+    if (c.phase !== "vote") {
+        verdict = `<p class="notice">Le vote n'est pas ouvert (phase : ${PHASES[c.phase]}).</p>`;
+    } else if (qualified.length) {
+        const names = running
+            .filter(x => qualified.includes(x.id))
+            .map(x => `${esc(x.t)} &amp; ${esc(x.r)}`)
+            .join(" et ");
+
+        verdict = `<p class="notice">✅ ${names} ${qualified.length > 1 ? "ont" : "a"} la majorité absolue : tu peux clôturer le tour.</p>`;
+    } else {
+        verdict = `<p class="notice">Majorité absolue : ${needed} voix sur ${c.valid} exprimée(s). Pas encore atteinte.</p>`;
+    }
+
+    const closeButton = c.phase === "vote"
+        ? `<button class="go" onclick="closeRound()">Clôturer le tour ${c.round}</button>`
+        : "";
+
+    const history = c.rounds.map(roundHTML).reverse().join("");
+
+    return `
+        <h1>En direct · ${esc(c.name)}</h1>
+        <p class="muted">
+            <span class="tag">${PHASES[c.phase]}</span>
+            Tour ${c.round} · élection ${seatLabel(c)} sur ${c.seats} ·
+            ${c.pairs.length} binôme(s) · mise à jour automatique
+        </p>
+
+        <div class="box">
+            <div class="row between">
+                <h2>Participation</h2>
+                <span>${c.cast} / ${c.n} (${percent(c.cast, c.n)} %)</span>
+            </div>
+            <div class="bar" aria-hidden="true"><i style="width:${percent(c.cast, c.n)}%"></i></div>
+            <p class="muted">${ballotsLine(c.valid, c.blank, c.abst)}</p>
+        </div>
+
+        ${accessBoxHTML(c)}
+
+        ${verdict}
+        ${m}
+
+        <div class="box">
+            <h2>Tous les binômes</h2>
+            ${rows}
+        </div>
+
+        ${electedHTML}
+
+        <div class="card-actions">
+            ${closeButton}
+            <button onclick="phase('${c.code}','vote','live')">Ouvrir le vote</button>
+            ${c.phase === "res" ? "" : `<button onclick="phase('${c.code}','res','live')">Publier les résultats</button>`}
+        </div>
+
+        <nav class="nav-row" aria-label="Navigation">
+            <button class="link" onclick="go('dash')">← Tableau de bord</button>
+            <button class="link" onclick="showQr('${c.code}')">QR code d'accès</button>
+            <button class="link" onclick="go('res')">Écran des résultats</button>
+            <button class="link" onclick="openDossier('${c.code}')">Dossier PDF</button>
+        </nav>
+
+        ${history ? `<h2>Tours précédents</h2><div class="grid">${history}</div>` : ""}`;
+}
+
+function viewResults(m) {
+    const c = C();
+
+    /* Les élèves ne voient rien tant que le prof n'a pas publié */
+    if (c.phase !== "res" && !prof) {
+        return `
+            <h1>Résultats</h1>
+            <p>Les résultats ne sont pas encore publiés.</p>
+            ${m}
+            <button onclick="go('role')">← Retour</button>`;
+    }
+
+    const elected = electedPairs(c);
+
+    const electedHTML = elected.length
+        ? `<div class="grid">${elected.map(x => `
+              <div class="box winner">
+                  <span class="tag win">Binôme n°${x.seat}</span>
+                  <h2>🏆 ${esc(x.t)} &amp; ${esc(x.r)}</h2>
+                  <p class="muted">Titulaire : ${esc(x.t)} · Remplaçant : ${esc(x.r)}</p>
+              </div>`).join("")}</div>`
+        : `<p class="notice">Aucun binôme n'a encore été élu à la majorité absolue.</p>`;
+
+    /* Si l'élection n'est pas terminée : état du tour en cours */
+    const running = rank(runningPairs(c));
+    const ongoing = elected.length < c.seats && running.length && c.cast > 0
+        ? `<div class="box">
+               <h2>Tour ${c.round} (en cours)</h2>
+               <p class="muted">${ballotsLine(c.valid, c.blank, c.abst)}</p>
+               ${running.map(x => barRowHTML(x, c.valid)).join("")}
+           </div>`
+        : "";
+
+    const history = c.rounds.map(roundHTML).reverse().join("");
+
+    const backTo = prof ? "dash" : "role";
+
+    return `
+        <h1>Résultats · ${esc(c.name)}</h1>
+        <p class="muted">${c.seats} binôme(s) à élire à la majorité absolue · ${c.rounds.length} tour(s) terminé(s)</p>
+
+        ${m}
+
+        ${electedHTML}
+        ${ongoing}
+
+        ${history ? `<h2>Détail des tours</h2><div class="grid">${history}</div>` : ""}
+
+        <div class="row">
+            <button onclick="go('${backTo}')">← Retour</button>
+        </div>`;
+}
+
+
+/* --- 5.4 Podium plein écran (côté élève) ----------------------------- */
+
+let podium     = null;   // écran ouvert : { root, onKey, previous }
+let podiumLast = "";     // dernier podium montré (évite de le rejouer à chaque rafraîchissement)
+
+/* Identifie des résultats précis : un nouveau résultat rejoue le podium */
+const podiumId = c => c.code + "|" + c.rounds.length + "|" + electedPairs(c).map(x => x.id).join(",");
+
+function podiumSeen(c) {
+    const id = podiumId(c);
+
+    if (podiumLast === id) {
+        return true;
+    }
+    try {
+        return sessionStorage.getItem("cv_podium") === id;
+    } catch (e) {
+        return false;
+    }
+}
+
+function closePodium() {
+    if (!podium) {
+        return;
+    }
+
+    const { root, onKey, previous } = podium;
+
+    stopPodiumSound();
+
+    document.removeEventListener("keydown", onKey, true);
+
+    root.remove();
+    document.body.classList.remove("dialog-lock");
+    podium = null;
+
+    if (previous && typeof previous.focus === "function") {
+        previous.focus();
+    }
+}
+
+/* Écran plein cadre avec animation : les marches montent une à une, le n°1 en dernier */
+function showPodium(c) {
+    closePodium();
+
+    const id = podiumId(c);
+
+    podiumLast = id;
+    try {
+        sessionStorage.setItem("cv_podium", id);
+    } catch (e) { /* stockage indisponible : on garde seulement la mémoire de l'onglet */ }
+
+    const list     = electedPairs(c).slice(0, 3);
+    const n        = list.length;
+    const delayOf  = r => 2.1 + (n - r) * 1.3;          // rang 1 = dernier révélé
+    const finalAt  = n ? delayOf(1) + .7 : 0;
+    const order    = n === 0 ? [] : n === 1 ? [1] : n === 2 ? [2, 1] : [2, 1, 3];   // 2e à gauche, 1er au centre
+    const colors   = ["#E8CB7C", "#8FA6DC", "#6F86CC", "#BCC9F2", "#DCE3F8"];
+
+    const cols = order.map(r => {
+        const x = list[r - 1];
+
+        return `
+            <div class="pd-col pd-r${r}" style="--d:${delayOf(r).toFixed(2)}s">
+                <div class="pd-who">
+                    ${r === 1 ? `<span class="pd-crown" aria-hidden="true">👑</span>` : ""}
+                    <b>${esc(x.t)} &amp; ${esc(x.r)}</b>
+                    <span>Titulaire : ${esc(x.t)} · Remplaçant : ${esc(x.r)}</span>
+                </div>
+                <div class="pd-step" aria-hidden="true"><small>Binôme</small><span>${r}</span></div>
+            </div>`;
+    }).join("");
+
+    const confetti = n
+        ? Array.from({ length: 70 }, (_, i) => `<i style="--x:${(Math.random() * 100).toFixed(1)}%;` +
+              `--cd:${(finalAt + Math.random() * 1.6).toFixed(2)}s;--t:${(3.2 + Math.random() * 3).toFixed(2)}s;` +
+              `--c:${colors[i % colors.length]};--rot:${Math.round(Math.random() * 360)}deg;` +
+              `--dx:${Math.round(Math.random() * 160 - 80)}px"></i>`).join("")
+        : "";
+
+    const summary = list.map(x => `Binôme n°${x.seat} : ${x.t} et ${x.r}`).join(". ");
+
+    const root = document.createElement("div");
+
+    root.className = "podium-screen";
+    root.setAttribute("role", "dialog");
+    root.setAttribute("aria-modal", "true");
+    root.setAttribute("aria-label", "Podium des résultats");
+
+    root.innerHTML = `
+        <p class="pd-sr">${esc(summary || "Aucun binôme n'a été élu.")}</p>
+
+        ${n ? `<div class="pd-intro" aria-hidden="true">Et les élus sont…</div>` : ""}
+
+        <div class="pd-main">
+            <h1 class="pd-title" ${n ? "" : `style="animation-delay:0s"`}>Résultats · ${esc(c.name)}</h1>
+
+            ${n
+                ? `<div class="pd-stage">${cols}</div>
+                   <p class="pd-final" style="--d:${(finalAt + 1.1).toFixed(2)}s">Félicitations aux délégués élus !</p>`
+                : `<p class="pd-none">Aucun binôme n'a été élu à la majorité absolue.</p>`}
+        </div>
+
+        <div class="pd-foot">
+            <button type="button" class="pd-btn go" data-act="close">Voir le détail des résultats</button>
+        </div>
+
+        <div class="pd-confetti" aria-hidden="true">${confetti}</div>`;
+
+    const onKey = e => {
+        if (e.key === "Escape") {
+            e.preventDefault();
+            closePodium();
+        }
+    };
+
+    root.querySelectorAll('[data-act="close"]').forEach(b => b.addEventListener("click", closePodium));
+
+    podium = { root, onKey, previous: document.activeElement };
+
+    document.addEventListener("keydown", onKey, true);
+    document.body.classList.add("dialog-lock");
+    document.body.appendChild(root);
+
+    root.querySelector('.pd-foot [data-act="close"]').focus();
+
+    playPodiumSound(n, delayOf, finalAt);
+}
+
+/* Appelé à chaque rendu : ouvre le podium aux élèves quand les résultats sont publiés,
+   et le ferme si le professeur les retire */
+function maybePodium() {
+    const here = !prof && view === "res" && cls && cls.phase === "res";
+
+    if (podium && !here) {
+        closePodium();
+        return;
+    }
+
+    if (here && !podium && !podiumSeen(cls)) {
+        showPodium(cls);
+    }
+}
+
+
+/* --- 5.5 Routeur ----------------------------------------------------- */
+
+const VIEWS = {
+    home:   viewHome,
+    plogin: viewTeacherLogin,
+    dash:   viewDashboard,
+    reset:  viewReset,
+    account: viewAccount,
+    role:   viewRole,
+    cand:   viewCandidate,
+    vote:   viewVoter,
+    res:    viewResults,
+    live:   viewLive
+};
+
+function render() {
+    const m = `<p class="msg" id="msg" role="alert">${esc(msg)}</p>`;
+    msg = "";
+
+    const draw = VIEWS[view];
+
+    if (draw) {
+        $("#app").innerHTML = draw(m);
+    }
+
+    lastSig = cls && CLASS_VIEWS.includes(view)
+        ? view + "|" + signature(cls, voted)
+        : "";
+
+    lastDashSig = view === "dash" ? dashSig(myClasses) : "";
+
+    syncRealtime();
+    setTitle();
+    maybePodium();
+
+    if (view === "dossier") {
+        initSigPads();
+    }
+}
+
+
+/* ==========================================================================
+   6. ACTIONS
+   ========================================================================== */
+
+/* --- 6.1 Élève : rejoindre une classe -------------------------------- */
+
+async function joinCode() {
+    const k = $("#code").value.replace(/\D/g, "");
+
+    if (k.length !== 6) {
+        return err("Le code contient 6 chiffres.");
+    }
+
+    let c;
+
+    try {
+        await ensureMe();
+        c = await api.getClass(k);
+
+        if (!c) {
+            return err("Code inconnu.");
+        }
+    } catch (e) {
+        return err(explain(e));
+    }
+
+    cur = k;
+
+    /* Résultats déjà publiés : on les montre directement */
+    go(c.phase === "res" ? "res" : "role");
+}
+
+async function voteAccess() {
+    /* Accessible dès la phase de candidature : l'élève voit les binômes arriver.
+       La phase a pu changer depuis le dernier chargement : go() la relit. */
+    try {
+        const c = await api.getClass(cur);
+
+        if (!c) {
+            return go("home", "Cette élection n'existe plus.");
+        }
+
+        go(c.phase === "res" ? "res" : "vote");
+    } catch (e) {
+        err(explain(e));
+    }
+}
+
+
+/* --- 6.2 Professeur : compte ----------------------------------------- */
+
+async function plogin(create) {
+    const email = $("#pid").value.trim().toLowerCase();
+    const pw    = $("#pmdp").value;
+
+    if (!email || pw.length < 6) {
+        return err("E-mail requis et mot de passe de 6 caractères minimum.");
+    }
+
+    try {
+        const user = create
+            ? await api.signUp(email, pw)
+            : await api.signIn(email, pw);
+
+        if (!user) {
+            return err("Compte créé : confirme ton e-mail, puis connecte-toi.");
+        }
+
+        me   = user.id;
+        prof = user.id;
+    } catch (e) {
+        return err(explain(e));
+    }
+
+    go("dash");
+}
+
+async function forgot() {
+    const email = $("#pid").value.trim().toLowerCase();
+
+    if (!email) {
+        return err("Saisis ton adresse e-mail ci-dessus, puis clique sur « Mot de passe oublié ».");
+    }
+
+    try {
+        await api.resetPassword(email);
+    } catch (e) {
+        return err(explain(e));
+    }
+
+    info("Si un compte existe avec cette adresse, un e-mail de réinitialisation vient d'être envoyé. Pense à vérifier tes courriers indésirables.");
+}
+
+async function savePassword() {
+    const a = $("#np1").value;
+    const b = $("#np2").value;
+
+    if (a.length < 6) {
+        return err("Mot de passe de 6 caractères minimum.");
+    }
+    if (a !== b) {
+        return err("Les deux mots de passe ne correspondent pas.");
+    }
+
+    try {
+        const user = await api.updatePassword(a);
+        me   = user.id;
+        prof = user.id;
+    } catch (e) {
+        return err(explain(e));
+    }
+
+    recovering = false;
+    await go("dash");
+    info("Mot de passe modifié.");
+}
+
+async function deleteAccount() {
+    const pw = $("#dpw").value;
+
+    if (!pw) {
+        return err("Saisis ton mot de passe pour confirmer.");
+    }
+
+    /* On revérifie le mot de passe avant une action irréversible */
+    try {
+        await api.signIn(profEmail, pw);
+    } catch (e) {
+        return err(explain(e));
+    }
+
+    const yes = await askConfirm(
+        "Ton compte et toutes tes données (élections, résultats, actes de candidature, procès-verbaux) seront supprimés définitivement. Cette action est irréversible.",
+        { title: "Supprimer ton compte ?", ok: "Supprimer définitivement", danger: true }
+    );
+
+    if (!yes) {
+        return;
+    }
+
+    try {
+        await api.deleteAccount();
+    } catch (e) {
+        return err(explain(e));
+    }
+
+    prof      = null;
+    cur       = null;
+    cls       = null;
+    myClasses = [];
+    access    = [];
+    picked    = [];
+    profEmail = "";
+    me        = (await api.session()).id;   // nouvelle session anonyme
+
+    await go("home", "Ton compte a été supprimé.");
+    info("Ton compte a été supprimé.");
+}
+
+async function logout() {
+    await api.signOut();
+
+    prof      = null;
+    cur       = null;
+    cls       = null;
+    myClasses = [];
+    access    = [];
+    picked    = [];
+    me        = (await api.session()).id;   // nouvelle session anonyme
+
+    go("home");
+}
+
+
+/* --- 6.3 Professeur : élections -------------------------------------- */
+
+async function newClass() {
+    const name       = $("#cn").value.trim();
+    const n          = parseInt($("#nb").value, 10);
+    const doubleVote = $("#dbl").checked;
+    const needApproval = $("#cod").checked;
+
+    if (!name || !(n >= 1)) {
+        return err("Renseigne la classe et le nombre d'élèves.");
+    }
+
+    try {
+        await api.createClass(name, n, doubleVote, needApproval);
+    } catch (e) {
+        return err(e.code === "42501" ? "Tu as déjà une élection en cours." : explain(e));
+    }
+
+    go("dash");
+}
+
+async function phase(k, p, next = "dash") {
+    try {
+        /* Publier les résultats = clôturer d'abord le tour en cours : sans cela, aucun siège
+           n'est attribué et le podium annonce qu'aucun binôme n'est élu */
+        const known = (cls && cls.code === k ? cls : null) || myClasses.find(x => x.code === k);
+
+        if (p === "res" && known && known.phase === "vote") {
+            try {
+                await api.closeRound(k);
+            } catch (e) {
+                /* Aucun bulletin dans ce tour, ou vote déjà clos : rien à clôturer */
+                if (!/aucun bulletin|pas ouvert/i.test(String((e && e.message) || e))) {
+                    throw e;
+                }
+            }
+        }
+
+        await api.setPhase(k, p);
+        go(next);
+    } catch (e) {
+        go(next, explain(e));
+    }
+}
+
+/* Écran « en direct » : tous les binômes et leurs voix, mis à jour tout seul */
+function showLive(k) {
+    cur = k;
+    go("live");
+}
+
+/* Valide (ok = true) ou refuse / retire (ok = false) un élève */
+async function decide(id, ok) {
+    const request = access.find(a => a.voter_id === id);
+
+    try {
+        await api.decideAccess(cur, id, ok);
+
+        /* Mémoire locale (appareil du professeur) pour repérer les doublons */
+        let list = loadApproved(cur);
+
+        if (ok && request) {
+            list.push({ id, pseudo: request.pseudo });
+        } else if (!ok) {
+            list = list.filter(k => k.id !== id);
+        }
+        saveApproved(cur, list);
+
+        go("live");
+    } catch (e) {
+        go("live", explain(e));
+    }
+}
+
+/* Clôture le tour : le serveur désigne l'élu (majorité absolue) ou relance un tour */
+async function closeRound() {
+    const c = C();
+
+    if (!c || c.phase !== "vote") {
+        return;
+    }
+
+    const yes = await askConfirm(
+        "Les votes seront comptés et le tour suivant commencera si besoin.",
+        { title: "Clôturer le tour " + c.round + " ?", ok: "Clôturer le tour" }
+    );
+
+    if (!yes) {
+        return;
+    }
+
+    try {
+        await api.closeRound(cur);
+        go("live");
+    } catch (e) {
+        go("live", explain(e));
+    }
+}
+
+async function del(k) {
+    const yes = await askConfirm(
+        "Cette action est définitive.",
+        { title: "Supprimer cette élection ?", ok: "Supprimer", danger: true }
+    );
+
+    if (!yes) {
+        return;
+    }
+
+    try {
+        await api.deleteClass(k);
+        go("dash");
+    } catch (e) {
+        go("dash", explain(e));
+    }
+}
+
+
+/* --- 6.4 Candidat ---------------------------------------------------- */
+
+async function apply() {
+    const v    = id => $("#" + id).value.trim();
+    const t    = v("nt");
+    const r    = v("nr");
+    const prog = v("pg");
+
+    /* Acte de candidature : lu uniquement par le professeur */
+    const act = { classe: "", tp: t, tn: v("ntn"), sp: r, sn: v("nrn"), pres: v("pres"), mot: v("mot"), prog, slogan: v("slo") };
+
+    if (!t || !r || !act.tn || !act.sn) {
+        return err("Indique le nom et le prénom du titulaire et du suppléant.");
+    }
+
+    if (!act.pres || !act.mot || !prog) {
+        return err("Remplis ta présentation, tes motivations et ton programme.");
+    }
+
+    if (fold(t + " " + act.tn) === fold(r + " " + act.sn)) {
+        return err("Le titulaire et le remplaçant doivent être deux élèves différents.");
+    }
+
+    /* Phase et binômes relus en base : la copie locale peut être périmée */
+    let c;
+
+    try {
+        await ensureMe();
+        c = await api.getClass(cur);
+    } catch (e) {
+        return err(explain(e));
+    }
+
+    if (!c) {
+        return go("home", "Cette élection n'existe plus.");
+    }
+
+    if (c.phase !== "cand") {
+        return go("cand", "Les candidatures sont closes.");
+    }
+
+    if (c.pairs.some(x => x.owner === me)) {
+        return go("cand", "Tu as déjà présenté un binôme.");
+    }
+
+    act.classe = c.name;
+
+    try {
+        await api.saveAct(cur, act);
+    } catch (e) {
+        return err(e.code === "23505" ? "Tu as déjà présenté un binôme." : explain(e));
+    }
+
+    try {
+        await api.addPair(cur, t, r, prog.slice(0, 400));   // version publique, plus courte
+        go("cand");
+    } catch (e) {
+        await api.removeAct(cur).catch(() => {});
+
+        err(e.code === "23505" ? "Tu as déjà présenté un binôme." : explain(e));
+    }
+}
+
+async function unapply(id) {
+    if (C().phase !== "cand") {
+        return;
+    }
+
+    try {
+        await api.removePair(id);
+        await api.removeAct(cur).catch(() => {});
+        go("cand");
+    } catch (e) {
+        go("cand", explain(e));
+    }
+}
+
+
+/* --- 6.5 Électeur ---------------------------------------------------- */
+
+/* Coche / décoche un binôme sur le bulletin (1 ou 2 selon l'élection) */
+function pick(id) {
+    const c = C();
+
+    if (!c || voted || c.phase !== "vote") {
+        return;
+    }
+
+    if (picked.includes(id)) {
+        picked = picked.filter(x => x !== id);
+    } else {
+        picked.push(id);
+
+        /* Trop de choix : le plus ancien est remplacé */
+        while (picked.length > ballotPicks(c)) {
+            picked.shift();
+        }
+    }
+
+    softRender();
+}
+
+/* Élève : envoie son prénom/pseudo au professeur */
+async function requestAccess() {
+    const pseudo = $("#pseudo").value.trim();
+
+    if (!pseudo) {
+        return err("Indique ton prénom ou un pseudo que ton professeur reconnaîtra.");
+    }
+
+    try {
+        await api.requestAccess(cur, pseudo);
+        go("vote");
+    } catch (e) {
+        err(explain(e));
+    }
+}
+
+/* Dépose le bulletin : kind = "pair" (binôme[s] cochés), "blank" ou "abstain" */
+async function ballot(kind) {
+    const c = C();
+
+    if (!c || voted || c.phase !== "vote") {
+        return;
+    }
+
+    if (c.needApproval && myAccess.status !== "approved") {
+        return err("Ton accès au vote n'a pas encore été validé par le professeur.");
+    }
+
+    let question;
+    let title;
+    let okLabel;
+    let ids = [];
+
+    if (kind === "pair") {
+        const k = ballotPicks(c);
+
+        if (k < 1 || picked.length < 1 || picked.length > k) {
+            return err("Choisis au moins un binôme avant de valider (ou vote blanc / abstention).");
+        }
+
+        ids = picked.slice();
+
+        const names = ids
+            .map(id => c.pairs.find(p => p.id === id))
+            .filter(Boolean)
+            .map(x => x.t + " & " + x.r)
+            .join(" et ");
+
+        title    = "Confirmer ton vote";
+        okLabel  = "Voter";
+        question = "Tu votes pour " + names + ". Ton vote sera définitif.";
+    } else if (kind === "blank") {
+        title    = "Voter blanc ?";
+        okLabel  = "Voter blanc";
+        question = "Ton bulletin comptera comme une participation mais ne sera attribué à aucun binôme. C'est définitif.";
+    } else {
+        title    = "T'abstenir ?";
+        okLabel  = "M'abstenir";
+        question = "Tu ne prendras pas part à ce tour. C'est définitif.";
+    }
+
+    if (!(await askConfirm(question, { title, ok: okLabel }))) {
+        return;
+    }
+
+    try {
+        await api.castBallot(cur, kind, ids);
+        picked = [];
+        go("vote");
+    } catch (e) {
+        go("vote", explain(e));   // ex : « Ton accès au vote n'a pas été validé. »
+    }
+}
+
+
+/* ==========================================================================
+   7. MISE À JOUR AUTOMATIQUE (direct) 
+   ========================================================================== */
+
+/* Redessine l'écran sans perdre ce que l'utilisateur est en train de saisir */
+function softRender() {
+    const saved = [...document.querySelectorAll("#app input[id], #app textarea[id]")]
+        .map(el => ({
+            id:      el.id,
+            value:   el.value,
+            checked: el.checked,
+            focus:   el === document.activeElement
+        }));
+
+    render();
+
+    saved.forEach(s => {
+        const el = document.getElementById(s.id);
+
+        if (el) {
+            el.value = s.value;
+            el.checked = s.checked;
+
+            if (s.focus) {
+                el.focus();
+            }
+        }
+    });
+}
+
+/* Relit la classe ; ne redessine que si quelque chose a changé.
+   Quand le professeur publie les résultats, les élèves y sont emmenés
+   automatiquement, sans aucun clic. */
+async function poll() {
+    if (document.hidden || !cur || !POLL_VIEWS.includes(view)) {
+        return;
+    }
+
+    if (polling) {
+        again = true;
+        return;
+    }
+
+    polling = true;
+
+    try {
+        const fresh = await api.getClass(cur);
+
+        if (!fresh) {
+            return go("home", "Cette élection n'existe plus.");
+        }
+
+        /* L'utilisateur a pu changer d'écran pendant le chargement */
+        if (!POLL_VIEWS.includes(view)) {
+            return;
+        }
+
+        cls = fresh;
+
+        if (!prof) {
+            if (fresh.phase === "res" && view !== "res") {
+                view = "res";
+            } else if (fresh.phase !== "res" && view === "res") {
+                view = fresh.phase === "vote" ? "vote" : "role";
+            }
+        }
+
+        if (view === "vote") {
+            voted = await api.hasVoted(cur);
+
+            if (fresh.needApproval) {
+                myAccess = await api.myAccess(cur);
+            }
+        }
+
+        if (view === "live" && prof && fresh.needApproval) {
+            access = await api.accessRows(cur);
+            notifyAccess(cur, access);
+        }
+
+        const sig = view + "|" + signature(fresh, voted);
+
+        if (sig !== lastSig) {
+            lastSig = sig;
+            softRender();
+        }
+    } catch (e) {
+        console.warn("Mise à jour automatique impossible :", e);
+    } finally {
+        polling = false;
+
+        if (again) {
+            again = false;
+            refreshLive();
+        }
+    }
+}
+
+/* Tableau de bord du professeur : même principe que poll() */
+function dashSig(list) {
+    return JSON.stringify(list.map(c =>
+        [c.code, c.phase, c.round, c.cast, c.blank, c.abst, c.pairs.length, c.rounds.length]));
+}
+
+async function pollDash() {
+    if (document.hidden || view !== "dash" || !prof) {
+        return;
+    }
+
+    if (polling) {
+        again = true;
+        return;
+    }
+
+    polling = true;
+
+    try {
+        const fresh = await api.myClasses(prof);
+
+        if (view !== "dash") {
+            return;
+        }
+
+        myClasses = fresh;
+        watchAccessFromDash(fresh);
+
+        const sig = dashSig(fresh);
+
+        if (sig !== lastDashSig) {
+            lastDashSig = sig;
+            softRender();
+        }
+    } catch (e) {
+        console.warn("Mise à jour automatique impossible :", e);
+    } finally {
+        polling = false;
+
+        if (again) {
+            again = false;
+            refreshLive();
+        }
+    }
+}
+
+const refreshLive = () => view === "dash" ? pollDash() : poll();
+
+
+/* --- Temps réel : la base prévient dès qu'une ligne change -------------- */
+
+function watch(key, specs) {
+    if (rt.key === key) {
+        return;
+    }
+
+    if (rt.channel) {
+        sb.removeChannel(rt.channel);
+    }
+
+    rt = { key, channel: null };
+
+    if (!key) {
+        return;
+    }
+
+    const channel = sb.channel("live-" + (++rtCount));
+
+    specs.forEach(sp => channel.on(
+        "postgres_changes",
+        { event: "*", schema: "public", table: sp.table, filter: sp.filter },
+        refreshLive
+    ));
+
+    channel.subscribe();
+    rt.channel = channel;
+}
+
+/* S'abonne à ce que l'écran courant affiche (classe ouverte, ou toutes les classes du professeur) */
+function syncRealtime() {
+    let key   = "";
+    let specs = [];
+
+    if (cur && cls && POLL_VIEWS.includes(view)) {
+        key   = "class:" + cur;
+        specs = [
+            { table: "classes",      filter: "code=eq." + cur },
+            { table: "pairs",        filter: "class_code=eq." + cur },
+            { table: "voter_access", filter: "class_code=eq." + cur }
+        ];
+    } else if (view === "dash" && prof && myClasses.length) {
+        const codes = myClasses.map(c => c.code).join(",");
+
+        key   = "dash:" + codes;
+        specs = [
+            { table: "classes", filter: "owner=eq." + prof },
+            { table: "pairs",   filter: "class_code=in.(" + codes + ")" },
+            { table: "voter_access", filter: "class_code=in.(" + codes + ")" }
+        ];
+    }
+
+    watch(key, specs);
+}
+
+/* Filet de sécurité + rattrapage quand l'onglet redevient visible */
+setInterval(refreshLive, POLL_MS);
+document.addEventListener("visibilitychange", () => {
+    if (!document.hidden) {
+        refreshLive();
+    }
+});
+
+
+/* ==========================================================================
+   7bis. ACTES DE CANDIDATURE ET PROCÈS-VERBAL (PDF)
+   ========================================================================== */
+
+let acts    = [];     // actes de candidature de la classe (professeur uniquement)
+let minutes = null;   // procès-verbal enregistré (professeur uniquement)
+let pvRows  = 4;      // nombre de lignes « binômes » du procès-verbal affiché
+
+Object.assign(api, {
+
+    /* Élève : enregistre son acte (lisible par le professeur seulement) */
+    async saveAct(code, data) {
+        check(await sb.from("candidacy_forms").insert({ class_code: code, data }));
+    },
+
+    async removeAct(code) {
+        check(await sb.from("candidacy_forms").delete().eq("class_code", code).eq("owner", me));
+    },
+
+    /* Professeur : tous les actes de sa classe */
+    async acts(code) {
+        return check(
+            await sb.from("candidacy_forms")
+                .select("owner, data, created_at")
+                .eq("class_code", code)
+                .order("created_at")
+        );
+    },
+
+    async minutes(code) {
+        const row = check(await sb.from("minutes").select("data").eq("class_code", code).maybeSingle());
+        return row ? row.data : null;
+    },
+
+    /* Clôture : supprime définitivement actes et procès-verbal de la classe */
+    async purgeDossier(code) {
+        check(await sb.rpc("purge_dossier", { p_class: code }));
+
+        /* Un refus RLS ne renvoie aucune erreur : on vérifie qu'il ne reste rien */
+        const left = await api.acts(code);
+
+        if (left.length) {
+            throw new Error("Suppression impossible : exécute migration_v6.sql dans Supabase.");
+        }
+    },
+
+    async saveMinutes(code, data) {
+        check(await sb.from("minutes").upsert({
+            class_code: code,
+            data,
+            updated_at: new Date().toISOString()
+        }));
+    }
+});
+
+
+/* --- Génération des PDF (jsPDF, chargé à la demande) ------------------- */
+
+function loadPdf() {
+    if (window.jspdf) {
+        return Promise.resolve(window.jspdf.jsPDF);
+    }
+
+    return new Promise((resolve, reject) => {
+        const s = document.createElement("script");
+        s.src = "https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js";
+        s.onload  = () => resolve(window.jspdf.jsPDF);
+        s.onerror = () => reject(new Error("Module PDF indisponible : vérifie ta connexion."));
+        document.head.appendChild(s);
+    });
+}
+
+/* Les polices PDF standard ne connaissent que le Latin-1 */
+const pdfSafe = s => String(s ?? "")
+    .replace(/[‘’]/g, "'").replace(/[“”]/g, '"').replace(/…/g, "...")
+    .replace(/[–—]/g, "-").replace(/œ/g, "oe").replace(/Œ/g, "Oe")
+    .replace(/[^\n\u0020-\u007E\u00A0-\u00FF]/g, "");
+
+/* Palette du PDF : mêmes teintes que le site, version douce */
+const PDF = {
+    ink:    [34, 48, 79],      // texte
+    navy:   [52, 68, 112],     // bandeau et en-têtes de tableau
+    blue:   [74, 100, 176],
+    sky:    [143, 166, 220],   // bleu clair (dégradé, accents)
+    line:   [204, 213, 232],   // traits fins
+    frame:  [176, 188, 216],   // cadre de page
+    zebra:  [243, 246, 252],
+    muted:  [122, 134, 162],
+    sub:    [214, 223, 244]    // sous-titre du bandeau
+};
+
+/* Dégradé horizontal de bleus (liseré du haut de page) */
+function pdfGradient(doc, x, y, w, h) {
+    const steps = 42, a = PDF.navy, b = PDF.blue, c = PDF.sky;
+    for (let i = 0; i < steps; i++) {
+        const t = i / (steps - 1);
+        const [p, q, k] = t < .55 ? [a, b, t / .55] : [b, c, (t - .55) / .45];
+        doc.setFillColor(
+            Math.round(p[0] + (q[0] - p[0]) * k),
+            Math.round(p[1] + (q[1] - p[1]) * k),
+            Math.round(p[2] + (q[2] - p[2]) * k));
+        doc.rect(x + (w / steps) * i, y, w / steps + .15, h, "F");
+    }
+}
+
+/* Logo du PDF (PNG intégré : version blanche pour le bandeau, bleue pour le pied de page) */
+const PDF_LOGO_WHITE = "data:image/png;base64,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";
+const PDF_LOGO_BLUE  = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAFMAAABgCAYAAABhXE4DAAAcaElEQVR42u19e3RdV3nn7/v2PvdKthPiDDGkSabTtLSrDiQDCYHpGupk0diyZBzLzr1rTXkklmW7UAIlBEIek6PTEBIexWleEMWy45UnupElvyQbygRDmQ4FUygQYNphGIbWJAHi2rF07z17f9/8cc6VrqT7kGzJNmvNXussS7rnnsdvf8/f9+1twhyNMAw5iiLp2DB4lRK/EyROFQyQAgABooCSqja8EJFK+iNX/12VAIZCCZScCREmIlYQg5QIIFUSYgpItUil8t17H8//DFACSJHLGRQKvr17138haHHf1jWDuVy/KRTyfi4wsHMF5vPPX0IAIMCV2Zazu108CiI+oWsZ1MObGn9RFWADqMLFo7ctKuJfKkBWQGvrHriOiPoUGOvYMFgq9HUOo7/fIH/ygM4ZmFXDO1/y3pUFgJkVGCc0FAAlAk2GSJwTcTeP9K19cPymFSDXD3QaDh6DopXItILpifbuneuH82t3IVRGRHIyT8Jz/WqkIAIMiJimHZiHg5igRMSGAFX4m0b61j6IXL8BQLlcP6OQ9ys37lxprH0MoIUiIuJjIeLFIPtYR9fAakQkiSk5k8AkaEM91PTA3ByqKok5IS8qfzH8aOfDyPUbFPKCXD8XCnm/fMNAG8E8QcRnq3dSmQTxsTDoHLB9fEXX0GoQqZ4EoPOh5g2AtokcQefsmkxMql7Fuw+N9K19qAJkrr+fC/kESMuZp4lwjngn1YZckcy8AkyUOMaeHlBqO04/mKr1DaOq+5UqFVXVjHvk9B/S1O1PsayVUICgBCVVUh2PEFQVhmNVeWCkb+2DCENGNAFkW9fg240xTxLoHO9joWogVYWNZVU9piLr92/r3AMoRSdhN+0pUHOtwAHQBqfZr1HxeFbOgm+JLU14rRJZm9XKz+MPaLPqMyXyzhAAGOvVlLJagb3kS/EX+/K/hiqBSHL9/aaQz/u29f3LDPPTBD53OpAQNpahcpwIG4a3dQ4k3p5OyqOfQslUCOiFL/a1/XruHboSKA1/8nnf3jX0x2ToGSJzntQE0jBUjqv6jcOPri3MVazJp8xgqqqxEkCVloXPWajSrI4wZIQh1/yMSCvhT0f34NtguZ/IvlZ8PNlGKoQNMxRjXnXz8Na1T5+RQfuMTICogkiX5PoVRLM18sn5UTTtg4pqr+ja+Z+UzReYzGu8K0+1kcpsGIqSOnfj/u2dT84lkKdWMkHqvehcX7UC5KpNA28yxvYzmfO9j30NIAlEsZP4g8PbO/vmGsj5kUwmOlnbN3NCQLmQJ7/ihoE3iQbPMtsLvS97qsq8VFWZGCCK4eObDvSte2Q+gJwXyawX9CoAYqPNgZxZ0JzL9RtEJB3rBy6zgd3JbH/HxyWZCiQxA0TqpfzRfX1rH8z1zw+Q8wIm01RvPh7FaCPGCUTa1v34hQBpGIbcDMhCIe/bN+z8Q7XBs8zBb3tX9sSTVZuYQWD1Gt+2f+u6+yomIUkblc54MBsyIH46/ZbL9ZsoimR51+Aaw4u/3L5h59ooiiSX5NZ1gfyTG/a8DmSeNWx/z7myJ6oiVSpAJtnRx/ZvXffJStgEVDSA9DcWTFKosSy1gOnYMNhujdlujP19YrO1vWuoo1DI+6mAhqFyAuSzr8sE+qwxmaVTgVRVBRklYtI4vnV465pPV+4ThsoA6fIN/b/X3jX0x+k35kxCT1lopARS8VQtPETkV6wf+hMwP0FE57jymGNjF8PoE20bd68pPLr6YAWIRILJd6x/9mI19lljgktduSjENFkiiZWNYV8u3jmyfd29U79/7Q2DFzljd4q4ZwB8NZcrcKEAX8v0VDjamYxCISenNM5UCQgAfrL4ZSYi37Zx5zJWepLYLE7jQuu9E2OCc1j8kyu7htYUtq35Vi7XnykU8uXlNwxeBMtfMCZzqYtLfhKQSGJYYwP2rnzPyPZ1d6VAShgqRxH5Fe8cOD829FQ2e9YbysUjfY2m/kRy9HlIJ4moCQl8qHeTW7Xp/AUi/mETtCzx5VFHRDbJ7Ym9j8XY7AUK90x79+B1ha2d3+nYvOcCddpvTOaKOC5OtpFICiImyLJzpc+MbF1zW1JGyUsYJsC8Y8Ou13jSp9lk/nNcHhMV5vp0Pmlb98BbSfGHMFwiXznXT9QCxDGbDKAxCSgwxnzbzkZRc7kCL12aq2m4Dx8+xLlcP45NY9eryhEmUfNcrsCF83PF9p8P3e9d8UEwG4goKIlRiYh9XBKbaf1d54qPt23Yc4s4d3OQWfDWuDw2BcgktzJBll25uGVk25qPIgw5inoUIcaBFNanrG1dFsdjZWtbMoDUiCqUo4hkZffO3yfwbhO0nKfqgHE+xk6WQ1WwWQgtj72o4tvtbFxILdtSNQQAOjYOvVI/bEq8+Ysv/oBQyMsw8Ehb92CrYbtFCZJcIgWUiV08pmzs61X8LmJr43hMagDpjc0YF489MNLX+WH0AUCPogcARdL+vr2v9bF72piWq+J4zEM1QaGWVQcQhs/Zv//5kbtspuU8Vx5zqCkcaSRAKiC2ShIOb117yM5Eb0GEa/5s4LwgNrcq6asJiFWJkpfniu1nJoyq6H/0vgyC8tSaj2gC1JIll2iVJNzXvmHnQrbZj4t3kwElIhWnAFkVp4TJFToFvA1ajI9Ht41c2PkXk2hdIlzzroElKJWfsJlFV7nyqCOCVUAAImWKJ0cWBY6ivO/YOJQ3NpN3cckjNT01JUtVrG21Lh7brQtatoehclMwc/kCFwBvyvxfMwte9X7xpSr6dgqNSwTxMcTH44A0mqYoAhCGPBytvXtl12CrCbK3i48FEKq6B41ffIpEWps1Ph7dvvCC+L2ISKGKcSoO8DZrLzOZlrfH8agngkXCY5KPiy+K4ksAUFj6A03tq+94z54LRP3dRkWhwnVfQVXZWHKu+At43LH/gfbS/jBsDGbFC7Z3DXWQ4Y1x6ahTESjVB4oUBKqOX2miRkA1zo4UCMEjUecdK7sHjTXZj3lXFtAkyabpqp01zhcfG73gnE3D0dWuVl6vkEDFS3pvVYIyGQbJZw/0XfvjNDxThEpABM3424Og5eK4PDaJcarpQIiZ1N8z/Fjn93K5flOI8p4bIMlRBG1/X/9rwbib2GZFhEFkCTD1jslAVkOqpMJUE/6oR8Mw5JGtnbdKXNpigixDSerUYhIb6YpPvEgvbDoYXe2QpqM1IwsCI6k6ibVZ4135a6/Ev/7ryoe5XD9HEUn7pl1tYLPJxcWGQCrgTdDK4sp7j7tX9SJJJKRhBpR7/pKkQSLO3GaDBZd5X/Y1bpLWo7T6XzTz5rUAjaIeVVXat23Nh31cfsgEGQYmA6qAN7bFeFcaGI1f3niod3Oc1H2imjGhGWdYSIkMeR8fAdytB3esL6Knh8IwpEIhL2v+fOe/g8gnmdioCjVicZiYvSv/SpWigzuuLoboGScguFH+29a1cznDdLt4TGjauVqp7RDAlPzM1KA4NCkDqgVoxTq++cLVH/Bx6fM2yJoEUNWKs3GuuPN4pnzDwR3ri2EDIAFAKOGwSCHGGIb6z430Xff1MFRGFGma4Whc5I8Y23JpkjjUfwclEjYZAtwDI0kyYaKq+9taFBoRSdv64fOYS/eSMa0SO6HJdlKJDImKT4xhavohmghEDZtKBPUBNc3goRT1kG7a/K0P/Lz8fxfYTOt7XFyMrc0GPi4OBYIbDj6cf6XS29SYeBCBCIwNAudKh3Qse2/yPdJcWlNv3zj4R6r0Qe/L2ijbUFWxQYtx8dg3OJO5H1Dq74dUv+lUyaR8vsAJWMU7bLDgjd5NUW8VNTZLEPcAQ68GaDmpXqOiK1T9VQD1sclAVWWKFEOMNM91iRQ9IfX2XhEfd+ds9nHxiUzL2YGLi/tk7Nj1u7etOTYTINNQTIiNevHHVHDL/ifbj0apwSj052R119BZKvppNrZFRbRuBJLk/FBxx9Xonfs+t+rlMOxJnFe9dDKXy3GhkPdtGwbbme1mFxelOl5UhRibZe9K36WxTLjvqVUvT71v+4ahK8Hsichpkjto6syJZ1q2iCJBGPLB6Ori6q6h98XFY4cs+Ok9T7776EyBBICA1bHJkI/H+vZvW/vlSoaTy11iCpT38cbB91rT+kdNnQ5BgqDFxOXj2/b3rf1iot7TCWY7Wb0hbTeOnEdj5b8kNllx1eqdzo76GIwP7Xtq1cubNj0SnH/+Jg8Azz9fsAD8K9BFmWCBiQFD4zxEYl5lNp1bUSSA0u5tdAzAfSdCQIhgkSsd+2HGUaSq1EM94+FeR9ee14v6W8XH2uixVFWMzZq4PPojMXpPLfWeBmai3nmP0YHbg8yiy+N4zNMEGlCF2iDLzo3dM7K187lcrt/09uYdsFnTm8ZEpCs2DewbG/2Vh6qSsqnERQoRJf1fANDfn5OZVYoSGxqGoCjCjAndpUt/kHR82OAlo/jwrh2rj2CHUoRIQoDbbvyfWTn+/U9Y23KOi0uNpFKJWQGJVSk60LvucBiGTJRM9NT0MiUecqZQKPiVG3euZMoMqPhsmoVQApSoDVrIlYtfC8Adb7zoH45H49Jz5o5cTtMujcSnjxMZGwa7jQke9eKFElBq161UJMgs5Lh8/PGRvrXvqVB6deJf2MQG9cg179q5hASfZMutTuMJ9U7KpPDeFQW4Zfe2Ncf+LXzOoucqXyu0yj1/CS1efHHNmX755Z9IRWrGtXmuEezpGa/JTwYy5CgiWdHV/wcA3a0qadtSPSBVjM1wXB79iTi6s6JRPT0hRVGEVZt2X+RFbhP20YHetb9QBWwSa5HYzM7bbWbhG6aqN0BKbNnHxZ4D29b9HQAcjK52iKqrZVWM82Ti79SPaU0KE6bh8k2PBOzsx23QssTFjVNGooptwl0HdnT+NAyViUhyuX4GIN67D7UuOm/z6LGXXgHo5ny+P2mGStQ7GFIRW63eE5mHKpR2M+EFAVlSQdJHDlJVSpJiVVIoMUSVBBAQsVY48BpsHQBOutsaxndEIK2V1ad9tRPXpOT0jIB3H9h67dMVzz+u3psG/5RhnxDvKzFlA/Vu5bg8NnjlhZ3XJXNEGoYhRVEkbV27324s9pLCKpHzHuv2971j2LZ1D19IWr6H2WSc+qnBeeo/iEym5VoC1Wd+T/NQFRiTQal09Jj17t6pJYi27uELScp3p00SirouXNWYDMVx+V+DgG+NIpKk9KyIIuiqTZe/WkTuYc60+LjkTJBtESnd09k98I+WtLiGbfYy70vaSOxdeUxOoD/olA1SiIhnUnxk3/Z13x2PR0Nw7vl+Po7SXxrb8h+axpQKJWaGjz+7+/OdP54Umxby3vvBD2ayi95cLr/iich6V1I2waVFjdtYySyENg+mk97x+mzR6TygSibIBuLLX33BvLgtdaqadH1E8sqr7Eoie32SezdLGVvZlYtfG3VHHkqAhIZhyIVC3nds3nMlE3/AladwFapKIq0MVZtY2wZzNc4OnehRqx8dc3JdVRVmQ96Vj2SIbjrUuzmuLr++Y8Ou1xDoM8TESYZbn/FlNiSu9LIa++GDO9YXkdQ+EEU92nbjcFadu4uD7NmiftJ1CEQMI8wKqp8BEEBMSaFrFgdNPSYWXGD8mHIOTuBIrslsAhL1n9m1tfM7iTRFEoY9BJB6+I+ZoPUPvIubqjebgBT+wf2Prv5m5TqJ9yal0dK7TdC63NUgjhUKD8DWI3NTptqTwI0z66lXTgPdcca9suqsqi1dq4sl6bk6XlOaoJ6o6maTrj39WabaawWBHTFZF4999ayz3WcTZ4Px4Lyje/BtCvPnPi7NQL1b2LnS3wXCn64Q41ClApGsenf/vxfCjaouJpCpw8+orReWJCyJvwWELxuRVrEskiaBRoREiChI3o8l6W4TywI4kDcaIwazVaUY5E3VAgtKq6ScXivhOcVMXHtyfp38XZjTK7jkKmyUlcVrWX0J/6ewJT824b2h114/eE6s+Cu2NvCuVDNKqSpBkPjycSbcmbBSylFSgElIZg6OemRy3hevYQ4enESIjfP/gFWteRNNY8jvjfSt/Q5+MwYB0DCtlcfBzg8a2/rm5t5b1QZZ9nHxseG+zr+pSHX1Obt2dB4BcKSje/B3QJRWQaYLYf2CmgJquCUMlQ8fPmTOP/9yf6aiWCFBKinj6q6hNzqimyRZQNVAvRNK0ZWLPyQffLwi1bUqD0uX/kD//jBaeVplhqrUvP4swxB8EmP1U2/vFXJmC6ZSTw/00OHLF8Qin7UcnO2aqjdB1McgRMM7Vv2illROTFgkHRuHZHq1VKsJyvrst3jl3xAVRy5X4KTMFG82JnPV1AUCNRRPjM2y+viZkb7OLzQCcqIJp3HB0Na/F5E5wf70eo2qtUahkJOTbTytNBG0bR5aCsEdKk6TfL7+kiRjrPGu+FNHJgSAqAfajMKq7V+aq/lJjfnqGW9kknLh9zPH/+Wfthjbcm4zp4PEh6iI3PWlbWv/dxgqR3Siy/wm1NyCWGc3E/VPBpG23Th8Ho+VbyToIlWw1uzjIAGURDEaEP/1nr5rX6y0tsxeKhMiY2X3Gzcak1nuGzPn4ylj7EaH3nLRdx97S1qtnNErslC9sFy5fmMSZr2wdQL3owpdnm099y2NdkNQKAIOEBePKYDb0dPDs71pxXt3rN97scLdqSpN1DvpEfJx6TBnMrdFaeFu5vetb72Y6jsgqtiB2ch7Ltdv9j/QXjKM+8ulY7F3pTiOx3ytw5fHnCuPikK7OzbvuQBR1HSVRc1nBKCm/FdsM0vEO23UMKZEQmRIIfcNf27VD9NmhDmJUlSl2SYafra2UgCQy2YHVOJvGZsJUltRoyeJrEhM1maWiMifzV4qlaIokpUbdr2LOVgjTXNvTXuNSgcXHY0fCGeh3jOMzIgb2UwSnvX6xlyun/c/0F4i5sdUpWFnIYE12RRBunLrh8+LokgxE+nUxE52vmtgiZL/RJKVSKPzlTnpNSKhWwqFSuqJOeVnuZnBnb0nzwkAMu6lp31c/o61GVat86YE9j5WYzK/9QqV3w1A00aoxlLZ00MAUGrhe61tuci7yTsc1ErmyFiCd73D29d8Y2qP0CkBEydUpEj6eHZv6z4G4DHVBhUCpHsgJK/83rYbh8+Ommw8UmHQ2zcNdYDM9Qm11oQRSrpQvh14ukdVKZ3wExi+jjATlEHzkuFUpFMXtmz3cekfTdBMOstqbPC7OF6+LpE8UH317tGO9+5dDK+fYjacMnxUP7gzEPWjhswdu3Z0Hkn24DhRW2kaCsY8pYtUsZ1HYcyTTS1TUnchJnn/9dc/15KkddOlM0yBkFL8URNkl6ZliIaEr7EBi7gn9j66eiRdWHXC6q1S2+xRWrlomJufTPW7P5XOcsb3+bj0I9PAdhIRe1dWsL30RXOkrZJrT/HeSbm2a+gKIn6/+Fhnot7OFX8sY9IDKE1tgJj1sPWDcNYm+4vNMs6cZgtzuRx/+aG1v1JDTzfbykxV1RhrQHRTsiItmYxqwnfZ9dtbQPopEwSLpFELYMrhiLpYSXoOPLnucMJznpzTaeZB5pUVKhSWKgBqNa2fd674z4l0op50kndlJaK3ji4Mrq6YikQqE/VeYM/5gAmyV7u43LSeY4Isi3cD+x9d98zJqvdM4WwQTmhaIDgp2lZyuRwPfn7FiwTdmXTd1A9rVVWNzQRqcFPSJJWTChAdXQOvJ6JbVLw2lnCIMQH7uPhTsXQrANRbVTfbId7VXc4ybZHSfIylSxPpZLYPubj4s6QC2EA6fVlB/LajZ9krAdKlS3Mahs9ZIfqMsdlzxTtt4HQqvZYqKp868EjnT+dOKk8iziTQnKxSTXt9aG/v6p8R6SAbSw0WZZCKqLGZVma9uQLEN3/+6w1sMivSXspGZQi1QYbFx/vHLlz8KMKQTzymnPOgfW7jJaf8oIvH/nUm0kkwK0bPbb141aYnXw2YkOousJpQbzaGnCv+Ug1uORhd7dImglPT0qNKpwTMpPlJ6Yt91/4zAbuYbaPN60jFw9jsQvXS43Xhp02QPT/ZgqzR5CvSZSdbRno7vxfOwX6YZ7JkIrGd5n7nxl5gtlxvERYRk3clJaI/ZfANyc9oQvi2sHfFv110VrwFCDnqgc698Nn6MblhMJ8iONPWPNrbu/pHAHYyW9LGez+Sqqiqb5zcpz1C3pWOE/MthS35sTDswbx07Jn6xLmqEGsjMlVpjrer6UmkU+Rh74q/ZJNuxtqQAG78DEkLoCWFPjD8aOd/TzOl09L6yHNOGjWRTkCxb9u67ytohDnTTDqbZU0JI+RLhwKhT1Sp97yA2XBd5WmwmWk2AxDrQ86NHWMyJ7yTKhGTF1cW4PakRwg4XQ25JFDWBoX1ZjNxgtKpAGi4d803iPA3bDOkOnsOIGltyRDE7ziwtfNAynOevs5mImViolN82/Gcm0APe1cqp4G4zgZKYy07V/qJSHx7sni1Z97U+4yKM6cTIElWcsVvXfvfoPK3xmZnKZ2kKioK3Ll/e/6lMASdCvVuTA2fBptZAaPCT3rDD6VdvTQzAVAxNssibuQtF/xDujwFp33hgjKooc2c37gzqXP9Nn6xR9X9D5PYTmkGJbMl70q/JOhHJvjJU5Uy0pnlzSdLJ6i3d3OsxFvEe2m2VZcqKTOTgrYM96394WyWS5+aOLN23TzpQ5f5dU4V6Tzr38q7VeJvG5OFqjpNUp+phzM2w96Xv26Y7qsU106DENQL0xr1XxJgzSmRzkIhX4bS/SAiG7RYG2TZBi1VR5aDzAIrEo+p8i17e1ePhidVZZyfgN7WLagRwCLzHjZVnMfCY6/7witn/9NVTHyZqIyrfFIzhifigCADw32dX4cqnXgL4IkPT6q2jq9jrdsFp6fUdibh0uvLADZcvumR4OKXF0+axMWLL9ZDOIRkwZTSactyiE+kc5hOm7oc6t0cH2rgTk+ransPtfXrD7ZuBqTVa29OqfWhZlJ8pg575j3SGbxyuIma82/KrJ8pHruhZNYlgAkgr7xs2XMWeImXLQsbXOgqAF+p+hlVv2PK39Hg86/M4JVq3avW+MqUz79S41maPXMyjh07bJYte46YjnI9RkZIlVZu3HWXYXuHuFgmFqWqElsSL8tH+q790v+XyWSs3Lh7pSEaFqlu91ZlDsjD32y5pugSabK59DtXdg+9AURZVZHEGLAqSWVnmYkwRRKbUulPGt+bst6o5gRMmvem3xVf206pCjETQVTHv1ObDEnX1k/sBaIkhKn/oWX6/WSFgBDSbZigyZZ848+vMASKSfyb1BjUK6VYrbezqArYBNdT5Qbj4ZLW+X026Zg2DMeM1Vmnc/OTJE6dJA/vyg28OdUPRcTFoihPLgVUunqr14+nm8fM0CXWPreeFE8993TuE5Ls183108nG0zX9//2gOr/PhhOZr3NPD8dRLZmkld33G5dd9bRmRmfuIK2YLauqSmQIcKYx2U2nLXufpSpOn3OdJ+lUJBvSJg3YZBl8zLtyjIQzbGDToKjaOatiKVOnOHuRbWhjqYZ707qfTHtbnQneSg1NS7JKpFbrRpUTTdsXvSejKNnYyVMG8k2TYfIiaYerHU80x9dYVxaYpLm8ipBJuxSSxvmK+W3cIlvZ+B6GmpyX7E9c4RW8T/cBSf9OZGrufg0LwE15BmtRvd+xnfSdGnsMJzKlDopkT+eJ75IYNeLJs1FYgHysrCqesz/+fzvKKv3guFgyAAAAAElFTkSuQmCC";
+const LOGO_RATIO     = 0.8677;    // largeur / hauteur
+
+const slug = s => fold(s).replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "");
+
+function pdfFinish(doc) {
+    const n = doc.getNumberOfPages();
+    const today = new Date().toLocaleDateString("fr-FR");
+
+    for (let i = 1; i <= n; i++) {
+        doc.setPage(i);
+
+        /* Liseré en dégradé de bleus en haut de page */
+        pdfGradient(doc, 0, 0, 210, 2.4);
+
+        /* Cadre fin aux angles arrondis */
+        doc.setDrawColor(...PDF.frame);
+        doc.setLineWidth(.35);
+        doc.roundedRect(10, 10, 190, 276, 3, 3);
+
+        doc.addImage(PDF_LOGO_BLUE, "PNG", 18, 287.6, 4.2 * LOGO_RATIO, 4.2);
+
+        doc.setFont("helvetica", "normal");
+        doc.setFontSize(8);
+        doc.setTextColor(...PDF.muted);
+        doc.text("Document généré par ClassVote le " + today, 23.5, 291.5);
+        doc.text("Page " + i + " / " + n, 192, 291.5, { align: "right" });
+    }
+}
+
+function pdfBanner(doc, lines, sub) {
+    const M = 18, w = 174, y0 = 17;
+    const h = 7 + lines.length * 7.5 + (sub ? 8 : 0);
+
+    /* Bandeau arrondi */
+    doc.setFillColor(...PDF.navy);
+    doc.roundedRect(M, y0, w, h, 3, 3, "F");
+
+    /* Fine barre en dégradé de bleus sous le bandeau */
+    pdfGradient(doc, M + 20, y0 + h + 3.4, w - 40, 1);
+
+    /* Logo à gauche du bandeau */
+    const lh = 14, lw = lh * LOGO_RATIO;
+    doc.addImage(PDF_LOGO_WHITE, "PNG", M + 8, y0 + (h - lh) / 2, lw, lh);
+
+    doc.setTextColor(255, 255, 255);
+    doc.setFont("helvetica", "bold");
+    doc.setFontSize(15);
+    lines.forEach((t, i) => doc.text(pdfSafe(t), 105, y0 + 9 + i * 7.5, { align: "center" }));
+
+    if (sub) {
+        doc.setFont("helvetica", "normal");
+        doc.setFontSize(10);
+        doc.setTextColor(...PDF.sub);
+        doc.text(pdfSafe(sub), 105, y0 + 9 + lines.length * 7.5 + .5, { align: "center" });
+    }
+
+    doc.setTextColor(...PDF.ink);
+    return y0 + h + 12;
+}
+
+function pdfHeading(doc, text, y) {
+    doc.setFillColor(...PDF.blue);
+    doc.roundedRect(18, y - 4, 1.6, 5.2, .8, .8, "F");
+    doc.setFont("helvetica", "bold");
+    doc.setFontSize(10.5);
+    doc.setTextColor(...PDF.ink);
+    doc.text(pdfSafe(text), 22, y);
+    return y + 4;
+}
+
+/* Une page « ACTE DE CANDIDATURE » */
+function drawAct(doc, a) {
+    const M = 18, W = 210, w = W - 2 * M;
+    let y = 24;
+
+    const room = h => {
+        if (y + h > 282) {
+            doc.addPage();
+            y = 22;
+        }
+    };
+
+    y = pdfBanner(doc, ["ACTE DE CANDIDATURE"], "Élection des délégués de classe");
+    doc.setFontSize(11);
+    doc.setTextColor(...PDF.ink);
+
+    const field = (label, value) => {
+        doc.setFont("helvetica", "bold");
+        const lw = doc.getTextWidth(label) + 3;
+
+        doc.setFont("helvetica", "normal");
+        const lines = doc.splitTextToSize(pdfSafe(value), w - lw);
+
+        room(lines.length * 5.5 + 3);
+        doc.setFont("helvetica", "bold");
+        doc.text(label, M, y);
+        doc.setFont("helvetica", "normal");
+        doc.text(lines, M + lw, y);
+        y += lines.length * 5.5 + 3;
+    };
+
+    const block = (label, value) => {
+        doc.setFont("helvetica", "bold");
+        doc.setFontSize(10.5);
+        const head = doc.splitTextToSize("- " + label, w);
+
+        doc.setFont("helvetica", "normal");
+        const lines = doc.splitTextToSize(pdfSafe(value), w - 8);
+        const h = Math.max(26, lines.length * 4.9 + 8);
+
+        room(head.length * 5 + h + 8);
+
+        doc.setFont("helvetica", "bold");
+        doc.text(head, M, y);
+        y += head.length * 5 + 1.5;
+
+        doc.setDrawColor(...PDF.line);
+        doc.setLineWidth(.35);
+        doc.roundedRect(M, y, w, h, 2.5, 2.5);
+
+        doc.setFont("helvetica", "normal");
+        doc.text(lines, M + 4, y + 6.5);
+        y += h + 8;
+    };
+
+    field("CLASSE :", a.classe);
+    field("NOM, PRÉNOM DU TITULAIRE :", `${a.tn} ${a.tp}`);
+    field("NOM, PRÉNOM DU SUPPLÉANT :", `${a.sn} ${a.sp}`);
+    y += 4;
+
+    block("PRÉSENTEZ-VOUS BRIÈVEMENT (NOM, ÂGE, QUALITÉS) :", a.pres);
+    block("VOS MOTIVATIONS (POURQUOI VOUS AVEZ CHOISI D'ÊTRE CANDIDATS, COMMENT LE TITULAIRE A CHOISI SON SUPPLÉANT) :", a.mot);
+    block("VOTRE PROGRAMME (VOTRE RÔLE AUPRÈS DE LA CLASSE, DES PROFESSEURS, DE L'ADMINISTRATION, VOS PROJETS) :", a.prog);
+    block("VOTRE SLOGAN ? :", a.slogan);
+}
+
+/* Tableau simple : chaque ligne s'adapte à son texte */
+function pdfTable(doc, x, y, widths, head, rows, minH = 8) {
+    doc.setDrawColor(...PDF.line);
+    doc.setLineWidth(.25);
+    doc.setTextColor(...PDF.ink);
+
+    const draw = (cells, bold, zebra) => {
+        doc.setFont("helvetica", bold ? "bold" : "normal");
+        doc.setFontSize(9.5);
+
+        const lines = cells.map((c, i) => doc.splitTextToSize(pdfSafe(c), widths[i] - 4));
+        const h = Math.max(minH, Math.max(...lines.map(l => l.length)) * 4.4 + 4);
+
+        if (y + h > 282) {
+            doc.addPage();
+            y = 20;
+        }
+
+        let cx = x;
+
+        cells.forEach((_, i) => {
+            if (bold) {
+                doc.setFillColor(...PDF.navy);
+                doc.rect(cx, y, widths[i], h, "FD");
+                doc.setTextColor(255, 255, 255);
+            } else if (zebra) {
+                doc.setFillColor(...PDF.zebra);
+                doc.rect(cx, y, widths[i], h, "FD");
+                doc.setTextColor(...PDF.ink);
+            } else {
+                doc.rect(cx, y, widths[i], h);
+                doc.setTextColor(...PDF.ink);
+            }
+            /* Texte centré dans la case, horizontalement et verticalement (« / » compris) */
+            const top = y + (h - lines[i].length * 4.4) / 2;
+
+            lines[i].forEach((line, k) => {
+                doc.text(line, cx + widths[i] / 2, top + 3.4 + k * 4.4, { align: "center" });
+            });
+            cx += widths[i];
+        });
+
+        y += h;
+    };
+
+    draw(head, true);
+    rows.forEach((r, i) => draw(r, false, i % 2 === 1));
+    return y;
+}
+
+const PV_STATS = [
+    ["eleves",      "Nombre d'élèves de la classe"],
+    ["absents",     "Nombre d'élèves absents"],
+    ["abstentions", "Abstentions"],
+    ["votants",     "Votants"],
+    ["blancs",      "Bulletins blancs ou nuls"],
+    ["exprimes",    "Suffrages exprimés"],
+    ["majorite",    "Majorité absolue (1/2 des voix +1)"]
+];
+
+/* Année scolaire en cours (septembre → août) */
+function schoolYear() {
+    const d = new Date();
+    const y = d.getMonth() >= 8 ? d.getFullYear() : d.getFullYear() - 1;
+
+    return y + "-" + (y + 1);
+}
+
+/* « PROCÈS-VERBAL D'ÉLECTION DES DÉLÉGUÉS DE CLASSE » */
+function drawMinutes(doc, p, sg = {}) {
+    const M = 18, W = 210, w = W - 2 * M;
+    const dots = (v, n) => v || ".".repeat(n);
+    let y = 22;
+
+    y = pdfBanner(doc, ["PROCÈS-VERBAL D'ÉLECTION", "DES DÉLÉGUÉS DE CLASSE"], "Année scolaire " + pdfSafe(p.annee));
+    doc.setFont("helvetica", "normal");
+    doc.setFontSize(11);
+
+    const intro = doc.splitTextToSize(pdfSafe(
+        `Je soussigné(e) M. / Mme ${dots(p.prof, 20)} déclare avoir fait procéder le ${dots(p.date, 12)} ` +
+        `à l'élection des deux délégués de la classe de ${dots(p.classe, 12)}.`), w);
+
+    doc.text(intro, M, y);
+    y += intro.length * 5.5 + 5;
+
+    y = pdfHeading(doc, "RÉSULTATS DU SCRUTIN", y);
+
+    y = pdfTable(doc, M, y, [94, 40, 40],
+        ["TITULAIRE + SON SUPPLÉANT", "Suffrages 1er tour", "Suffrages 2ème tour"],
+        [
+            ...p.rows.map(r => [r.name, r.t1, r.t2]),
+            /* Les votes blancs et les abstentions sont comptés dans le PDF */
+            ["Votes blancs ou nuls", p.stats.blancs[0],      p.stats.blancs[1]],
+            ["Abstentions",          p.stats.abstentions[0], p.stats.abstentions[1]]
+        ]) + 8;
+
+    y = pdfHeading(doc, "RÉCAPITULATIF DES VOTES", y);
+
+    y = pdfTable(doc, M, y, [94, 40, 40],
+        ["", "1er tour", "2ème tour"],
+        PV_STATS.map(([k, label]) => [label, p.stats[k][0], p.stats[k][1]])) + 9;
+
+    if (y > 225) {
+        doc.addPage();
+        y = 22;
+    }
+
+    y = pdfHeading(doc, "ÉLÈVES ÉLUS DÉLÉGUÉS", y);
+
+    y = pdfTable(doc, M, y, [114, 60],
+        ["TITULAIRE + SUPPLÉANT", "Régime : D.P, EXT"],
+        p.elus.map(e => [e.name || "/", e.regime || "/"]), 10) + 12;
+
+    doc.setFont("helvetica", "normal");
+    drawSignatures(doc, p, y, sg);
+}
+
+/* --- Signatures du procès-verbal ---------------------------------------
+   Dessinées à l'écran (doigt ou souris), uniquement gardées en mémoire :
+   rien n'est envoyé à la base. Une zone vide reste un cadre à signer à la main. */
+
+const SIG_SLOTS = [
+    ["pres", "Président de séance (professeur)"],
+    ["ass0", "Assesseur 1"],
+    ["ass1", "Assesseur 2"],
+    ["bin0t", "Binôme élu 1 · titulaire"],
+    ["bin0s", "Binôme élu 1 · suppléant"],
+    ["bin1t", "Binôme élu 2 · titulaire"],
+    ["bin1s", "Binôme élu 2 · suppléant"]
+];
+const SIG_W = 600, SIG_H = 220;   // taille interne des zones de dessin
+
+let sigs      = {};     // { pres, ass0, ass1, bin0t, bin0s, bin1t, bin1s } → image PNG (data URL)
+let sigsClass = null;   // classe à laquelle appartiennent les signatures
+
+function sigPadsHTML() {
+    return SIG_SLOTS.map(([k, label]) => `
+        <div class="sig">
+            <span class="small muted">${label}</span>
+            <canvas class="sig-pad" id="sig-${k}" width="${SIG_W}" height="${SIG_H}"
+                    role="img" aria-label="Zone de signature : ${label}"></canvas>
+            <button type="button" class="link" onclick="clearSig('${k}')">Effacer</button>
+        </div>`).join("");
+}
+
+function initSigPads() {
+    SIG_SLOTS.forEach(([k]) => {
+        const cv = $("#sig-" + k);
+
+        if (!cv) {
+            return;
+        }
+
+        const ctx = cv.getContext("2d");
+        let drawing = false;
+        let last = null;
+
+        ctx.lineWidth   = 4;
+        ctx.lineCap     = "round";
+        ctx.lineJoin    = "round";
+        ctx.strokeStyle = ctx.fillStyle = "#22304F";
+
+        /* Signature déjà dessinée (retour sur l'écran) */
+        if (sigs[k]) {
+            const img = new Image();
+
+            img.onload = () => ctx.drawImage(img, 0, 0);
+            img.src = sigs[k];
+        }
+
+        const pos = e => {
+            const r = cv.getBoundingClientRect();
+
+            return [(e.clientX - r.left) * cv.width / r.width, (e.clientY - r.top) * cv.height / r.height];
+        };
+
+        cv.onpointerdown = e => {
+            e.preventDefault();
+            cv.setPointerCapture(e.pointerId);
+            drawing = true;
+            last = pos(e);
+            ctx.beginPath();
+            ctx.arc(last[0], last[1], 2, 0, Math.PI * 2);
+            ctx.fill();
+        };
+
+        cv.onpointermove = e => {
+            if (!drawing) {
+                return;
+            }
+
+            const p = pos(e);
+
+            ctx.beginPath();
+            ctx.moveTo(last[0], last[1]);
+            ctx.lineTo(p[0], p[1]);
+            ctx.stroke();
+            last = p;
+        };
+
+        const end = () => {
+            if (drawing) {
+                drawing = false;
+                sigs[k] = cv.toDataURL("image/png");
+            }
+        };
+
+        cv.onpointerup = end;
+        cv.onpointercancel = end;
+    });
+}
+
+/* Découpe l'image au plus près du tracé pour qu'elle remplisse bien le cadre du PDF */
+function trimSig(url) {
+    return new Promise(resolve => {
+        const img = new Image();
+
+        img.onload = () => {
+            const src = document.createElement("canvas");
+
+            src.width  = img.width;
+            src.height = img.height;
+
+            const sctx = src.getContext("2d");
+
+            sctx.drawImage(img, 0, 0);
+
+            const d = sctx.getImageData(0, 0, src.width, src.height).data;
+            let x0 = src.width, y0 = src.height, x1 = -1, y1 = -1;
+
+            for (let y = 0; y < src.height; y++) {
+                for (let x = 0; x < src.width; x++) {
+                    if (d[(y * src.width + x) * 4 + 3] > 8) {
+                        x0 = Math.min(x0, x);
+                        x1 = Math.max(x1, x);
+                        y0 = Math.min(y0, y);
+                        y1 = Math.max(y1, y);
+                    }
+                }
+            }
+
+            if (x1 < 0) {
+                return resolve(null);   // rien de dessiné
+            }
+
+            const pad = 6;
+            x0 = Math.max(0, x0 - pad);
+            y0 = Math.max(0, y0 - pad);
+            x1 = Math.min(src.width - 1, x1 + pad);
+            y1 = Math.min(src.height - 1, y1 + pad);
+
+            const w = x1 - x0 + 1;
+            const h = y1 - y0 + 1;
+            const out = document.createElement("canvas");
+
+            out.width  = w;
+            out.height = h;
+            out.getContext("2d").drawImage(src, x0, y0, w, h, 0, 0, w, h);
+            resolve({ url: out.toDataURL("image/png"), w, h });
+        };
+
+        img.onerror = () => resolve(null);
+        img.src = url;
+    });
+}
+
+async function trimmedSigs() {
+    const out = {};
+
+    for (const k of Object.keys(sigs)) {
+        const t = await trimSig(sigs[k]);
+
+        if (t) {
+            out[k] = t;
+        }
+    }
+    return out;
+}
+
+function clearSig(k) {
+    const cv = $("#sig-" + k);
+
+    delete sigs[k];
+
+    if (cv) {
+        cv.getContext("2d").clearRect(0, 0, cv.width, cv.height);
+    }
+}
+
+/* Bloc « SIGNATURES » en bas du PV : 3 cadres, puis 2 cadres pour les binômes élus */
+function drawSignatures(doc, p, y, sg) {
+    const M = 18;
+
+    if (y > 178) {
+        doc.addPage();
+        y = 22;
+    }
+
+    doc.setFont("helvetica", "normal");
+    doc.setFontSize(10);
+    doc.setTextColor(...PDF.ink);
+    doc.text(pdfSafe("Fait à " + ".".repeat(28) + ", le " + (p.date || ".".repeat(14))), M, y);
+    y += 10;
+    y = pdfHeading(doc, "SIGNATURES", y) + 3;
+
+    const box = (x, top, bw, label, name, img) => {
+        doc.setFont("helvetica", "bold");
+        doc.setFontSize(8.5);
+        doc.text(pdfSafe(label), x, top);
+
+        doc.setFont("helvetica", "normal");
+        doc.text(doc.splitTextToSize(pdfSafe(name || ""), bw)[0] || "", x, top + 4.2);
+
+        doc.setDrawColor(...PDF.line);
+        doc.setLineWidth(.35);
+        doc.roundedRect(x, top + 6, bw, 30, 2.5, 2.5);
+
+        if (img) {
+            const k  = Math.min((bw - 18) / img.w, 13 / img.h);
+            const iw = img.w * k;
+            const ih = img.h * k;
+
+            doc.addImage(img.url, "PNG", x + (bw - iw) / 2, top + 6 + (30 - ih) / 2, iw, ih);
+        }
+    };
+
+    [
+        ["Président de séance", p.president,      sg.pres],
+        ["Assesseur 1",         p.assesseurs[0],  sg.ass0],
+        ["Assesseur 2",         p.assesseurs[1],  sg.ass1]
+    ].forEach(([label, name, img], i) => box(M + i * 59, y, 56, label, name, img));
+
+    y += 46;
+
+    /* « Titulaire + suppléant » → deux noms, un cadre chacun */
+    const split = n => {
+        const [a, b] = String(n || "").split("+");
+
+        return [(a || "").trim(), (b || "").trim()];
+    };
+    const [n1t, n1s] = split(p.elus[0].name);
+    const [n2t, n2s] = split(p.elus[1].name);
+
+    [
+        ["Binôme 1 · Titulaire", n1t, sg.bin0t],
+        ["Binôme 1 · Suppléant", n1s, sg.bin0s],
+        ["Binôme 2 · Titulaire", n2t, sg.bin1t],
+        ["Binôme 2 · Suppléant", n2s, sg.bin1s]
+    ].forEach(([label, name, img], i) => box(M + i * 44.5, y, 40.5, label, name, img));
+}
+
+function note(text, ok) {
+    const el = $("#msg");
+
+    if (el) {
+        el.textContent = text;
+        el.classList.toggle("ok", !!ok);
+    }
+}
+
+async function savePdf(list, name) {
+    try {
+        const J   = await loadPdf();
+        const doc = new J({ unit: "mm", format: "a4" });
+
+        list.forEach((a, i) => {
+            if (i) {
+                doc.addPage();
+            }
+            drawAct(doc, a.data);
+        });
+
+        pdfFinish(doc);
+        doc.save(name);
+        note("PDF téléchargé.", true);
+    } catch (e) {
+        note(explain(e));
+    }
+}
+
+function downloadAct(owner) {
+    const a = acts.find(z => z.owner === owner);
+
+    if (a) {
+        savePdf([a], `acte-candidature-${slug(a.data.classe)}-${slug(a.data.tn)}-${slug(a.data.sn)}.pdf`);
+    }
+}
+
+function downloadAllActs() {
+    if (!acts.length) {
+        return note("Aucun acte à télécharger.");
+    }
+    savePdf(acts, `actes-candidature-${slug(C().name)}.pdf`);
+}
+
+
+/* --- Procès-verbal : formulaire du professeur -------------------------- */
+
+/* Pré-remplissage à partir du vote (modifiable par le professeur) */
+function defaultMinutes(c) {
+    /* Tour archivé, ou tour en cours (pas encore clôturé) avec ses compteurs live */
+    const roundAt = i => {
+        if (c.rounds[i]) {
+            return c.rounds[i];
+        }
+
+        if (i === c.rounds.length && c.phase === "vote" && c.cast > 0) {
+            return {
+                n: c.n, cast: c.cast, blank: c.blank, abstain: c.abst, valid: c.valid,
+                results: c.pairs.filter(x => x.seat == null).map(x => ({ id: x.id, votes: x.votes }))
+            };
+        }
+        return undefined;
+    };
+
+    const r1 = roundAt(0);
+    const r2 = roundAt(1);
+
+    const votes = (h, id) => {
+        const x = h && (h.results || []).find(z => z.id === id);
+        return x ? String(x.votes) : "";
+    };
+
+    const stats = h => {
+        if (!h) {
+            return {};
+        }
+        const valid = h.valid ?? h.cast;
+
+        return {
+            eleves: h.n, absents: Math.max(0, h.n - h.cast), abstentions: h.abstain || 0,
+            votants: h.cast - (h.abstain || 0), blancs: h.blank || 0,
+            exprimes: valid, majorite: Math.floor(valid / 2) + 1
+        };
+    };
+
+    const nameOf = x => {
+        const a = acts.find(z => z.owner === x.owner);
+        return a ? `${a.data.tn} ${a.data.tp} + ${a.data.sn} ${a.data.sp}` : `${x.t} + ${x.r}`;
+    };
+
+    const s1 = stats(r1);
+    const s2 = stats(r2);
+
+    const rows = c.pairs.slice(0, 8).map(x => ({ name: nameOf(x), t1: votes(r1, x.id), t2: votes(r2, x.id) }));
+    const elus = electedPairs(c).slice(0, 2).map(x => ({ name: nameOf(x), regime: "" }));
+
+    while (rows.length < 4) {
+        rows.push({ name: "", t1: "", t2: "" });
+    }
+    while (elus.length < 2) {
+        elus.push({ name: "", regime: "" });
+    }
+
+    return {
+        prof: "", date: new Date().toLocaleDateString("fr-FR"), classe: c.name, annee: schoolYear(),
+        rows,
+        stats: Object.fromEntries(PV_STATS.map(([k]) => [k, [String(s1[k] ?? ""), String(s2[k] ?? "")]])),
+        elus, president: "", assesseurs: ["", ""]
+    };
+}
+
+function readMinutes() {
+    const g = id => ($("#" + id) ? $("#" + id).value.trim() : "");
+
+    return {
+        prof: g("pv-prof"), date: g("pv-date"), classe: g("pv-classe"), annee: g("pv-annee"),
+        rows: Array.from({ length: pvRows }, (_, i) => ({ name: g("pv-n" + i), t1: g("pv-a" + i), t2: g("pv-b" + i) })),
+        stats: Object.fromEntries(PV_STATS.map(([k]) => [k, [g(`pv-s-${k}-1`), g(`pv-s-${k}-2`)]])),
+        elus: [0, 1].map(i => ({ name: g("pv-en" + i), regime: g("pv-er" + i) })),
+        president: g("pv-pres"),
+        assesseurs: [g("pv-ass0"), g("pv-ass1")]
+    };
+}
+
+function viewDossier(m) {
+    const c  = C();
+    const def = defaultMinutes(c);
+    const pm  = minutes ? { ...def, ...minutes } : def;
+
+    /* Cases de statistiques restées vides dans le PV enregistré : reprises du vote */
+    pm.stats = Object.fromEntries(PV_STATS.map(([k]) => {
+        const saved = (minutes && minutes.stats && minutes.stats[k]) || [];
+        const auto  = def.stats[k] || ["", ""];
+
+        return [k, [saved[0] || auto[0] || "", saved[1] || auto[1] || ""]];
+    }));
+
+    pvRows = pm.rows.length;
+
+    const field = (id, label, val) =>
+        `<label class="fld"><span class="small muted">${label}</span><input id="${id}" value="${esc(val)}" maxlength="80"></label>`;
+
+    const actsHTML = c.pairs.map(x => {
+        const a = acts.find(z => z.owner === x.owner);
+
+        return a
+            ? `<div class="access-row row between">
+                   <span><b>${esc(x.t)} &amp; ${esc(x.r)}</b><br>
+                         <span class="muted small">${esc(a.data.tn)} ${esc(a.data.tp)} · ${esc(a.data.sn)} ${esc(a.data.sp)}</span></span>
+                   <button onclick="downloadAct('${esc(a.owner)}')">Télécharger (PDF)</button>
+               </div>`
+            : `<div class="access-row"><b>${esc(x.t)} &amp; ${esc(x.r)}</b> <span class="muted small">· pas d'acte enregistré</span></div>`;
+    }).join("") || `<p class="muted">Aucun binôme pour l'instant.</p>`;
+
+    const rowsHTML = pm.rows.map((r, i) => `
+        <tr>
+            <td><input id="pv-n${i}" value="${esc(r.name)}" aria-label="Binôme ${i + 1}"></td>
+            <td><input id="pv-a${i}" value="${esc(r.t1)}" aria-label="Suffrages 1er tour, binôme ${i + 1}"></td>
+            <td><input id="pv-b${i}" value="${esc(r.t2)}" aria-label="Suffrages 2ème tour, binôme ${i + 1}"></td>
+        </tr>`).join("");
+
+    const statsHTML = PV_STATS.map(([k, label]) => `
+        <tr>
+            <th scope="row">${label}</th>
+            <td><input id="pv-s-${k}-1" value="${esc(pm.stats[k][0])}" aria-label="${label}, 1er tour"></td>
+            <td><input id="pv-s-${k}-2" value="${esc(pm.stats[k][1])}" aria-label="${label}, 2ème tour"></td>
+        </tr>`).join("");
+
+    const elusHTML = pm.elus.map((e, i) => `
+        <tr>
+            <td><input id="pv-en${i}" value="${esc(e.name)}" aria-label="Élu ${i + 1}"></td>
+            <td>
+                <select id="pv-er${i}" aria-label="Régime, élu ${i + 1}">
+                    ${["", "D.P", "EXT"].map(o => `<option value="${o}" ${e.regime === o ? "selected" : ""}>${o || "—"}</option>`).join("")}
+                </select>
+            </td>
+        </tr>`).join("");
+
+    const padsHTML = sigPadsHTML();
+
+    return `
+        <h1>Dossier · ${esc(c.name)}</h1>
+        <p class="muted">Réservé au professeur : actes de candidature et procès-verbal.</p>
+
+        ${m}
+
+        <div class="box">
+            <div class="row between">
+                <h2>Actes de candidature</h2>
+                <button class="go" onclick="downloadAllActs()">Tout télécharger (1 PDF)</button>
+            </div>
+            ${actsHTML}
+        </div>
+
+        <form class="box pv" onsubmit="event.preventDefault(); saveMinutes()">
+            <h2>Procès-verbal d'élection</h2>
+            <p class="muted small">Pré-rempli à partir du vote ; corrige ce qui doit l'être (absents, régime, noms…).</p>
+
+            <div class="split">
+                ${field("pv-prof", "Je soussigné(e) M. / Mme", pm.prof)}
+                ${field("pv-date", "Élection du", pm.date)}
+                ${field("pv-classe", "Classe de", pm.classe)}
+                ${field("pv-annee", "Année scolaire", pm.annee)}
+            </div>
+
+            <div class="scroll"><table>
+                <tr><th>Titulaire + suppléant</th><th>1er tour</th><th>2ème tour</th></tr>
+                ${rowsHTML}
+            </table></div>
+
+            <div class="scroll"><table>
+                <tr><th></th><th>1er tour</th><th>2ème tour</th></tr>
+                ${statsHTML}
+            </table></div>
+
+            <h2>Élèves élus délégués</h2>
+            <div class="scroll"><table>
+                <tr><th>Titulaire + suppléant</th><th>Régime</th></tr>
+                ${elusHTML}
+            </table></div>
+
+            <div class="split">
+                ${field("pv-pres", "Président de séance", pm.president)}
+                ${field("pv-ass0", "Assesseur 1", pm.assesseurs[0])}
+                ${field("pv-ass1", "Assesseur 2", pm.assesseurs[1])}
+            </div>
+
+            <h2>Signatures</h2>
+            <div class="sigs">${padsHTML}</div>
+
+            <div class="row">
+                <button class="go">Enregistrer</button>
+                <button type="button" onclick="downloadMinutes()">Enregistrer et télécharger (PDF)</button>
+            </div>
+        </form>
+
+        <div class="box">
+            <h2>Clôturer l'élection</h2>
+            <p class="muted">Supprime définitivement l'élection (la classe, ses binômes et ses résultats),
+               les actes de candidature et le procès-verbal enregistrés.
+               Télécharge-les d'abord : après la clôture, plus rien n'est récupérable.</p>
+            ${c.phase === "res" ? "" : `<p class="notice">Publie d'abord les résultats pour pouvoir clôturer.</p>`}
+            <div class="row">
+                <button class="danger" onclick="closeElection()" ${c.phase === "res" ? "" : "disabled"}>Clôturer et supprimer l'élection</button>
+            </div>
+        </div>
+
+        <button class="link" onclick="go('dash')">← Tableau de bord</button>`;
+}
+
+Object.assign(VIEWS, { dossier: viewDossier });
+
+function openDossier(k) {
+    if (prof) {
+        if (sigsClass !== k) {
+            sigs = {};
+            sigsClass = k;
+        }
+        cur = k;
+        go("dossier");
+    }
+}
+
+async function saveMinutes(quiet) {
+    const p = readMinutes();
+
+    try {
+        await api.saveMinutes(cur, p);
+        minutes = p;
+        if (!quiet) {
+            note("Procès-verbal enregistré.", true);
+        }
+        return p;
+    } catch (e) {
+        note(explain(e));
+        return null;
+    }
+}
+
+async function closeElection() {
+    if (C().phase !== "res") {
+        return note("Publie d'abord les résultats.");
+    }
+
+    const yes = await askConfirm(
+        "L'élection sera supprimée définitivement, avec ses résultats, les actes de candidature et le procès-verbal. Les as-tu téléchargés ?",
+        { title: "Clôturer et supprimer l'élection ?", ok: "Clôturer et supprimer", danger: true }
+    );
+
+    if (!yes) {
+        return;
+    }
+
+    const code = cur;
+
+    try {
+        /* 1. Actes de candidature et procès-verbal */
+        await api.purgeDossier(code);
+        minutes = null;
+        acts    = [];
+        sigs    = {};
+        sigsClass = null;
+
+        /* 2. La classe elle-même (binômes, accès et bulletins partent en cascade) */
+        await api.deleteClass(code);
+
+        /* 3. Mémoire locale du professeur pour cette classe */
+        try {
+            localStorage.removeItem("approved:" + code);
+        } catch (e) { /* stockage indisponible : rien à nettoyer */ }
+
+        cur = null;
+        cls = null;
+        go("dash", "Élection clôturée : l'élection et toutes ses données ont été supprimées.");
+    } catch (e) {
+        note(explain(e));
+    }
+}
+
+async function downloadMinutes() {
+    const p = await saveMinutes(true);
+
+    if (!p) {
+        return;
+    }
+
+    try {
+        const J   = await loadPdf();
+        const doc = new J({ unit: "mm", format: "a4" });
+
+        drawMinutes(doc, p, await trimmedSigs());
+        pdfFinish(doc);
+        doc.save(`proces-verbal-${slug(p.classe) || "classe"}.pdf`);
+        note("Procès-verbal enregistré et téléchargé.", true);
+    } catch (e) {
+        note(explain(e));
+    }
+}
+
+
+/* ==========================================================================
+   7ter. QR CODE D'ACCÈS À L'ÉLECTION
+   ========================================================================== */
+
+/* Lien qui ouvre directement l'élection : https://site/?code=123456 */
+function joinUrl(code) {
+    const base = location.origin && location.origin !== "null"
+        ? location.origin + location.pathname
+        : location.href.split(/[?#]/)[0];
+
+    return base + "?code=" + code;
+}
+
+/* Bibliothèque QR (qrcode-generator, MIT), chargée à la demande */
+function loadQr() {
+    if (window.qrcode) {
+        return Promise.resolve(window.qrcode);
+    }
+
+    return new Promise((resolve, reject) => {
+        const s = document.createElement("script");
+        s.src = "https://cdnjs.cloudflare.com/ajax/libs/qrcode-generator/1.4.4/qrcode.min.js";
+        s.onload  = () => window.qrcode ? resolve(window.qrcode) : reject(new Error("QR code indisponible."));
+        s.onerror = () => reject(new Error("QR code indisponible : vérifie ta connexion."));
+        document.head.appendChild(s);
+    });
+}
+
+/* Renvoie le QR code (SVG) du texte donné */
+async function qrSvg(text) {
+    const make = await loadQr();
+    const qr   = make(0, "H");   /* niveau H : tolère le logo au centre */
+
+    qr.addData(text);
+    qr.make();
+
+    return qr.createSvgTag({ cellSize: 4, margin: 2, scalable: true });
+}
+
+let qrOpen = null;
+
+/* Fenêtre plein cadre : le professeur la projette, les élèves scannent */
+async function showQr(code) {
+    if (qrOpen) {
+        qrOpen();
+    }
+
+    const url      = joinUrl(code);
+    const previous = document.activeElement;
+    const root     = document.createElement("div");
+
+    root.className = "dialog-backdrop";
+    root.innerHTML = `
+        <div class="dialog qr-dialog" role="dialog" aria-modal="true" aria-labelledby="qr-title">
+            <h2 id="qr-title">Rejoindre l'élection</h2>
+            <p>Scanne ce QR code avec l'appareil photo, ou entre le code à la main.</p>
+            <div class="qr-box" id="qr-box" aria-label="QR code vers l'élection">Chargement…</div>
+            <div class="code" aria-label="Code ${esc(code)}">${[...code].map(d => `<span>${esc(d)}</span>`).join("")}</div>
+            <p class="small" id="qr-status" role="status"></p>
+            <div class="row dialog-actions">
+                <button type="button" data-act="copy">Copier le lien</button>
+                <button type="button" data-act="close" class="go">Fermer</button>
+            </div>
+        </div>`;
+
+    const close = () => {
+        document.removeEventListener("keydown", onKey, true);
+        root.remove();
+        document.body.classList.remove("dialog-lock");
+        qrOpen = null;
+
+        if (previous && typeof previous.focus === "function") {
+            previous.focus();
+        }
+    };
+
+    const onKey = e => {
+        if (e.key === "Escape") {
+            e.preventDefault();
+            close();
+        }
+    };
+
+    const status = text => {
+        const el = root.querySelector("#qr-status");
+
+        if (el) {
+            el.textContent = text;
+        }
+    };
+
+    root.querySelector('[data-act="close"]').addEventListener("click", close);
+    root.addEventListener("mousedown", e => {
+        if (e.target === root) {
+            close();
+        }
+    });
+
+    root.querySelector('[data-act="copy"]').addEventListener("click", async () => {
+        try {
+            await navigator.clipboard.writeText(url);
+            status("Lien copié.");
+        } catch (e) {
+            status("Copie impossible : sélectionne le lien et copie-le.");
+        }
+    });
+
+    qrOpen = close;
+    document.addEventListener("keydown", onKey, true);
+    document.body.classList.add("dialog-lock");
+    document.body.appendChild(root);
+    root.querySelector('[data-act="close"]').focus();
+
+    try {
+        const svg = await qrSvg(url);
+        const box = root.querySelector("#qr-box");
+
+        if (box) {
+            box.innerHTML = svg + '<span class="qr-logo" aria-hidden="true"></span>';
+        }
+    } catch (e) {
+        const box = root.querySelector("#qr-box");
+
+        if (box) {
+            box.textContent = "";
+        }
+        status(explain(e));
+    }
+}
+
+/* Arrivée par un QR code (?code=123456) : on rejoint l'élection sans saisie */
+async function joinFromLink(k) {
+    try {
+        await ensureMe();
+
+        const c = await api.getClass(k);
+
+        if (!c) {
+            return go("home", "Code inconnu : demande un nouveau QR code à ton professeur.");
+        }
+
+        cur = k;
+        go(c.phase === "res" ? "res" : "role");
+    } catch (e) {
+        go("home", explain(e));
+    }
+}
+
+/* Lit et retire ?code=… de l'adresse ; renvoie le code s'il est valide */
+function codeFromLink() {
+    let k = null;
+
+    try {
+        const params = new URLSearchParams(location.search);
+        const raw    = (params.get("code") || "").trim();
+
+        if (params.has("code")) {
+            params.delete("code");
+
+            const rest = params.toString();
+            history.replaceState(null, "", location.pathname + (rest ? "?" + rest : "") + location.hash);
+        }
+
+        k = /^[0-9]{6}$/.test(raw) ? raw : null;
+    } catch (e) { /* adresse illisible : on ignore */ }
+
+    return k;
+}
+
+
+/* ==========================================================================
+   7quater. SONS ET NOTIFICATIONS
+   ========================================================================== */
+
+/* Les sons sont fabriqués par le navigateur (Web Audio) : aucun fichier à charger */
+let audio = null;
+
+function audioCtx() {
+    try {
+        if (!audio) {
+            const AC = window.AudioContext || window.webkitAudioContext;
+
+            if (!AC) {
+                return null;
+            }
+            audio = new AC();
+        }
+        return audio;
+    } catch (e) {
+        return null;
+    }
+}
+
+/* Exécute fn(ac) quand le son est autorisé ; ne fait rien (sans erreur) s'il est bloqué */
+function whenAudioReady(fn) {
+    const ac = audioCtx();
+
+    if (!ac) {
+        return;
+    }
+
+    if (ac.state === "running") {
+        fn(ac);
+    } else {
+        ac.resume()
+            .then(() => {
+                if (ac.state === "running") {
+                    fn(ac);
+                }
+            })
+            .catch(() => {});
+    }
+}
+
+/* Une note */
+function tone(ac, out, { t, f, d = .2, type = "sine", v = .2, to }) {
+    const o = ac.createOscillator();
+    const g = ac.createGain();
+
+    o.type = type;
+    o.frequency.setValueAtTime(f, t);
+
+    if (to) {
+        o.frequency.exponentialRampToValueAtTime(to, t + d);
+    }
+
+    g.gain.setValueAtTime(0.0001, t);
+    g.gain.exponentialRampToValueAtTime(v, t + .015);
+    g.gain.exponentialRampToValueAtTime(0.0001, t + d);
+
+    o.connect(g);
+    g.connect(out);
+    o.start(t);
+    o.stop(t + d + .05);
+}
+
+/* Un coup de caisse claire / un souffle */
+function noise(ac, out, { t, d = .1, v = .15, freq = 1500 }) {
+    const len  = Math.max(1, Math.floor(ac.sampleRate * d));
+    const buf  = ac.createBuffer(1, len, ac.sampleRate);
+    const data = buf.getChannelData(0);
+
+    for (let i = 0; i < len; i++) {
+        data[i] = Math.random() * 2 - 1;
+    }
+
+    const src  = ac.createBufferSource();
+    const filt = ac.createBiquadFilter();
+    const g    = ac.createGain();
+
+    src.buffer = buf;
+    filt.type = "bandpass";
+    filt.frequency.value = freq;
+
+    g.gain.setValueAtTime(v, t);
+    g.gain.exponentialRampToValueAtTime(0.0001, t + d);
+
+    src.connect(filt);
+    filt.connect(g);
+    g.connect(out);
+    src.start(t);
+    src.stop(t + d);
+}
+
+/* --- Podium : roulement de tambour, marches qui montent, fanfare ------- */
+
+let podiumAudio = null;   // volume général du podium (coupé à la fermeture)
+
+function stopPodiumSound() {
+    if (!podiumAudio) {
+        return;
+    }
+
+    try {
+        podiumAudio.gain.value = 0;
+        podiumAudio.disconnect();
+    } catch (e) { /* déjà coupé */ }
+
+    podiumAudio = null;
+}
+
+/* Calé sur l'animation : delayOf(rang) = montée de la marche, finalAt = arrivée du n°1 */
+function playPodiumSound(n, delayOf, finalAt) {
+    if (!n) {
+        return;
+    }
+
+    whenAudioReady(ac => {
+        if (!podium) {
+            return;     // fermé entre-temps
+        }
+
+        stopPodiumSound();
+
+        const master = ac.createGain();
+
+        master.gain.value = .8;
+        master.connect(ac.destination);
+        podiumAudio = master;
+
+        const calm = window.matchMedia && window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+        const t0   = ac.currentTime + .05;
+
+        if (!calm) {
+            /* Roulement de tambour pendant « Et les élus sont… », de plus en plus serré */
+            for (let t = .2, gap = .16; t < 2.05; t += gap, gap = Math.max(.04, gap * .92)) {
+                noise(ac, master, { t: t0 + t, d: .07, v: .05 + t * .05, freq: 1800 });
+            }
+
+            /* Chaque marche : souffle qui monte, puis choc grave */
+            for (let r = n; r >= 1; r--) {
+                const at = t0 + delayOf(r);
+
+                tone(ac, master, { t: at, f: 180, to: 560, d: .55, type: "sawtooth", v: .06 });
+                tone(ac, master, { t: at + .55, f: 150, to: 50, d: .35, v: .5 });
+                noise(ac, master, { t: at + .55, d: .2, v: .2, freq: 600 });
+            }
+        }
+
+        /* Fanfare à l'arrivée du binôme n°1, avec les confettis */
+        const fin = t0 + (calm ? 0 : finalAt);
+
+        noise(ac, master, { t: fin, d: .5, v: .18, freq: 4000 });
+
+        [523.25, 659.25, 783.99, 1046.5].forEach((f, i) => {
+            tone(ac, master, { t: fin + i * .11, f, d: .3, type: "triangle", v: .18 });
+        });
+
+        [523.25, 659.25, 783.99, 1046.5].forEach(f => {
+            tone(ac, master, { t: fin + .55, f, d: 1.3, type: "triangle", v: .12 });
+        });
+    });
+}
+
+/* --- Notification côté professeur --------------------------------------- */
+
+/* « Ding » à deux notes */
+function ding() {
+    whenAudioReady(ac => {
+        const t = ac.currentTime + .02;
+
+        tone(ac, ac.destination, { t,       f: 880,    d: .25, v: .15 });
+        tone(ac, ac.destination, { t: t + .14, f: 1318.5, d: .5,  v: .15 });
+    });
+}
+
+/* Petite bulle en haut de l'écran (3 au maximum, disparaît seule) */
+function toast(text, actions) {
+    let root = document.getElementById("toast-root");
+
+    if (!root) {
+        root = document.createElement("div");
+        root.id = "toast-root";
+        root.setAttribute("role", "status");
+        root.setAttribute("aria-live", "polite");
+        document.body.appendChild(root);
+    }
+
+    while (root.children && root.children.length >= 3) {
+        root.removeChild(root.firstChild);
+    }
+
+    const el = document.createElement("div");
+
+    el.className = "toast";
+    el.innerHTML = `<span>${esc(text)}</span>`;
+
+    [].concat(actions || []).forEach(action => {
+        const b = document.createElement("button");
+
+        b.type = "button";
+        b.className = action.cls || "go";
+        b.textContent = action.label;
+        b.addEventListener("click", () => {
+            el.remove();
+            action.run();
+        });
+        el.appendChild(b);
+    });
+
+    const x = document.createElement("button");
+
+    x.type = "button";
+    x.className = "link";
+    x.textContent = "✕";
+    x.setAttribute("aria-label", "Fermer la notification");
+    x.addEventListener("click", () => el.remove());
+    el.appendChild(x);
+
+    root.appendChild(el);
+    setTimeout(() => el.remove(), 10000);
+}
+
+/* Demandes d'accès déjà vues (celles encore en attente à la dernière vérification) */
+let seenAccess = { code: "", ids: new Set(), ready: false };
+
+/* Prévient le professeur quand une NOUVELLE demande d'élève arrive.
+   La première lecture d'une classe sert de point de départ : pas de notification. */
+function notifyAccess(code, rows, className) {
+    if (seenAccess.code !== code) {
+        seenAccess = { code, ids: new Set(), ready: false };
+    }
+
+    const pending = rows.filter(a => a.status === "pending");
+    const fresh   = pending.filter(a => !seenAccess.ids.has(a.voter_id));
+
+    /* On ne garde que les demandes encore en attente : un élève refusé qui redemande est « nouveau » */
+    const wasReady = seenAccess.ready;
+
+    seenAccess.ids   = new Set(pending.map(a => a.voter_id));
+    seenAccess.ready = true;
+
+    if (!wasReady || !fresh.length) {
+        return;
+    }
+
+    const where = className ? " (" + className + ")" : "";
+
+    if (fresh.length === 1) {
+        const a    = fresh[0];
+        const name = a.pseudo || "Un élève";
+
+        /* Même prénom déjà validé (appareil du professeur) ou déjà en attente : on prévient */
+        const same = x => fold(x.pseudo) === fold(a.pseudo);
+        const dup  = !!a.pseudo && (loadApproved(code).some(same) || pending.filter(same).length > 1);
+
+        toast(name + " demande à voter" + where + (dup ? " ⚠ doublon possible" : ""), [
+            { label: "Valider", run: () => decideFromToast(code, a.voter_id, true,  name) },
+            { label: "Refuser", cls: "danger", run: () => decideFromToast(code, a.voter_id, false, name) }
+        ]);
+    } else {
+        toast(
+            fresh.length + " nouvelles demandes de vote" + where,
+            view === "live" ? null : { label: "Voir", run: () => showLive(code) }
+        );
+    }
+
+    ding();
+}
+
+/* Valide ou refuse un élève directement depuis la notification */
+async function decideFromToast(code, id, ok, name) {
+    try {
+        await api.decideAccess(code, id, ok);
+
+        /* Mémoire locale (appareil du professeur) pour repérer les doublons, comme decide() */
+        if (ok) {
+            const list = loadApproved(code);
+
+            list.push({ id, pseudo: name });
+            saveApproved(code, list);
+        }
+
+        toast(name + (ok ? " est validé(e)." : " est refusé(e)."));
+        refreshLive();
+    } catch (e) {
+        toast(explain(e));
+    }
+}
+
+/* Depuis le tableau de bord : surveille la demande d'accès de l'élection en cours */
+async function watchAccessFromDash(list) {
+    const active = list.find(c => c.needApproval && c.phase !== "res");
+
+    if (!active) {
+        return;
+    }
+
+    try {
+        notifyAccess(active.code, await api.accessRows(active.code), active.name);
+    } catch (e) {
+        console.warn("Notifications indisponibles :", e);
+    }
+}
+
+
+/* ==========================================================================
+   8. THÈME, COOKIES ET PAGES LÉGALES
+   ========================================================================== */
+
+/* --- 8.1 Cookies maison (le jeton de session Supabase est géré à part) -- */
+
+const CONSENT_KEY = "cv_consent";   // « all » ou « essential », 6 mois
+const THEME_KEY   = "cv_theme";     // « light » ou « dark », seulement si « all »
+const COOKIE_DAYS = 180;
+
+function readCookie(name) {
+    const m = document.cookie.match(new RegExp("(?:^|; )" + name + "=([^;]*)"));
+    return m ? decodeURIComponent(m[1]) : null;
+}
+
+function writeCookie(name, value, days) {
+    const secure = location.protocol === "https:" ? "; Secure" : "";
+    document.cookie = `${name}=${encodeURIComponent(value)}; max-age=${days * 86400}; path=/; SameSite=Lax${secure}`;
+}
+
+function eraseCookie(name) {
+    document.cookie = `${name}=; max-age=0; path=/; SameSite=Lax`;
+}
+
+
+/* --- 8.2 Mode sombre ---------------------------------------------------- */
+
+const darkQuery = window.matchMedia("(prefers-color-scheme: dark)");
+
+const currentTheme = () => document.documentElement.dataset.theme === "dark" ? "dark" : "light";
+
+function setTheme(theme, persist) {
+    document.documentElement.dataset.theme = theme;
+
+    const meta = document.querySelector('meta[name="theme-color"]');
+    if (meta) {
+        meta.content = theme === "dark" ? "#111830" : "#F1F4FA";
+    }
+
+    const btn = $("#theme-btn");
+    if (btn) {
+        btn.setAttribute("aria-label", theme === "dark" ? "Passer en mode clair" : "Passer en mode sombre");
+    }
+
+    /* Mémorisé uniquement si l'utilisateur a accepté les cookies de préférence */
+    if (persist && readCookie(CONSENT_KEY) === "all") {
+        writeCookie(THEME_KEY, theme, COOKIE_DAYS);
+    }
+}
+
+function toggleTheme() {
+    setTheme(currentTheme() === "dark" ? "light" : "dark", true);
+}
+
+/* Sans choix mémorisé, on suit le réglage du système en direct */
+darkQuery.addEventListener("change", e => {
+    if (!readCookie(THEME_KEY)) {
+        setTheme(e.matches ? "dark" : "light");
+    }
+});
+
+setTheme(currentTheme());
+
+
+/* --- 8.3 Bandeau de consentement --------------------------------------- */
+
+function showConsent(custom) {
+    const prefs = readCookie(CONSENT_KEY) === "all";
+
+    const body = custom
+        ? `
+            <label class="opt">
+                <input type="checkbox" checked disabled>
+                <span><b>Essentiels</b> (toujours actifs) : connexion anonyme ou professeur, mémorisation de ton choix.</span>
+            </label>
+            <label class="opt">
+                <input type="checkbox" id="ck-pref" ${prefs ? "checked" : ""}>
+                <span><b>Préférences</b> : retenir ton thème clair ou sombre.</span>
+            </label>
+            <div class="row">
+                <button class="go" onclick="saveConsent()">Enregistrer mes choix</button>
+                <button class="link" onclick="showConsent(false)">Retour</button>
+            </div>`
+        : `
+            <p class="muted small">
+                Ce site utilise uniquement le stockage nécessaire à son fonctionnement.
+                Tu peux en plus autoriser la mémorisation de ton thème. Aucun cookie publicitaire
+                ni de mesure d'audience. <a href="#/cookies">En savoir plus</a>
+            </p>
+            <div class="row">
+                <button class="go" onclick="setConsent('essential')">Tout refuser</button>
+                <button class="go" onclick="setConsent('all')">Tout accepter</button>
+                <button class="link" onclick="showConsent(true)">Personnaliser</button>
+            </div>`;
+
+    $("#consent-root").innerHTML = `
+        <section class="consent" role="dialog" aria-labelledby="ck-t">
+            <div class="consent-card">
+                <h2 id="ck-t">🍪 Cookies</h2>
+                ${body}
+            </div>
+        </section>`;
+
+    const first = $("#consent-root button, #consent-root input:not([disabled])");
+    if (first && custom) {
+        first.focus();
+    }
+}
+
+function setConsent(value) {
+    writeCookie(CONSENT_KEY, value, COOKIE_DAYS);
+
+    if (value === "all") {
+        writeCookie(THEME_KEY, currentTheme(), COOKIE_DAYS);
+    } else {
+        eraseCookie(THEME_KEY);
+    }
+
+    $("#consent-root").innerHTML = "";
+}
+
+function saveConsent() {
+    setConsent($("#ck-pref").checked ? "all" : "essential");
+}
+
+
+/* --- 8.4 Contenu des pages légales ------------------------------------- */
+
+const TODO = () => "[]";   // à remplir : voir les emplacements « [] » dans les pages légales
+const UPDATED = "18 octobre 2026";
+
+const SLUGS = {
+    legal:   "mentions-legales",
+    cgu:     "cgu",
+    privacy: "confidentialite",
+    cookies: "cookies"
+};
+
+const PAGE_TITLES = {
+    legal:   "Mentions légales",
+    cgu:     "Conditions générales d'utilisation",
+    privacy: "Politique de confidentialité",
+    cookies: "Cookies",
+    nf:      "Page introuvable"
+};
+
+const STATIC_VIEWS = Object.keys(PAGE_TITLES);
+
+let backView = "home";   // écran où revenir en quittant une page légale
+
+const docHTML = (title, body) => `
+    <article class="doc">
+        <h1>${title}</h1>
+        <p class="muted small">Dernière mise à jour : ${UPDATED}</p>
+        ${body}
+        <div class="row"><button class="link" onclick="closePage()">← Retour à l'application</button></div>
+    </article>`;
+
+function viewLegal() {
+    return docHTML("Mentions légales", `
+        <p class="muted small">Ces mentions sont publiées en application de l'article 6-III de la loi n° 2004-575
+           du 21 juin 2004 pour la confiance dans l'économie numérique (LCEN).</p>
+
+        <h2>1. Éditeurs du site</h2>
+        <p>ClassVote est édité, à titre non professionnel, par <b>Enzo Perdu</b> et <b>Emerick Woiret</b>,
+           personnes physiques.</p>
+        <p>Contact : ${TODO("enzo.perdu@outlook.fr")}</p>
+        <p>Conformément à l'article 6-III-2 de la LCEN, les éditeurs ayant la qualité de personnes non professionnelles
+           ont communiqué leur identité à l'hébergeur du site, qui peut la transmettre à l'autorité judiciaire.</p>
+
+        <h2>2. Directeurs de la publication</h2>
+        <p>Enzo Perdu et Emerick Woiret.</p>
+
+        <h2>3. Hébergement</h2>
+        <p>Site : ${TODO("nom, adresse postale et téléphone de l'hébergeur, par exemple Vercel Inc.")}</p>
+        <p>Base de données et authentification : Supabase (supabase.com), ${TODO("région d'hébergement choisie")}.</p>
+
+        <h2>4. Propriété intellectuelle</h2>
+        <p>© 2026 Enzo Perdu et Emerick Woiret. Tous droits réservés.</p>
+        <p>Le nom ClassVote, le code source, la conception graphique, les textes et l'organisation de ce site
+           sont la propriété exclusive de leurs auteurs, protégés par le Code de la propriété intellectuelle
+           (article L.111-1). Toute reproduction, représentation, modification ou exploitation, totale ou partielle,
+           sans leur autorisation écrite préalable est interdite (article L.122-4) et constitue une contrefaçon
+           punie de trois ans d'emprisonnement et de 300 000 € d'amende (article L.335-2).</p>
+        <p>Les contenus saisis par les utilisateurs (prénoms, programmes) restent leur propriété ;
+           ils autorisent seulement leur affichage dans l'élection concernée.</p>
+        <p>Éléments tiers : polices Fraunces et Public Sans (licence SIL OFL, via Google Fonts)
+           et bibliothèques Supabase JS, jsPDF et qrcode-generator (licence MIT).</p>
+
+        <h2>5. Responsabilité</h2>
+        <p>Les éditeurs s'efforcent de fournir un service fiable, mais ne sont tenus qu'à une obligation de moyens.
+           Leur responsabilité n'est engagée, conformément aux articles 1231-1 et 1240 du Code civil, qu'en cas de faute prouvée
+           ayant causé un dommage direct. Ils ne répondent pas d'une interruption, d'une perte de données
+           ou d'un usage non conforme du service.</p>
+
+        <h2>6. Signalement d'un contenu illicite</h2>
+        <p>Tout contenu manifestement illicite peut être signalé à l'adresse de contact, avec la description des faits
+           et l'adresse de la page concernée (article 6-I-5 de la LCEN). Il sera retiré promptement.</p>
+
+        <h2>7. Données personnelles</h2>
+        <p>Le traitement des données est décrit dans la <a href="#/confidentialite">politique de confidentialité</a>
+           et la page <a href="#/cookies">Cookies</a>, conformément au règlement (UE) 2016/679 (RGPD)
+           et à la loi n° 78-17 du 6 janvier 1978 modifiée.</p>
+
+        <h2>8. Droit applicable</h2>
+        <p>Le droit français s'applique. En cas de litige, les parties cherchent d'abord une solution amiable ;
+           à défaut, les tribunaux français sont compétents, sous réserve des règles protégeant les consommateurs.</p>`);
+}
+
+function viewCgu() {
+    return docHTML("Conditions générales d'utilisation", `
+        <h2>1. Objet et acceptation</h2>
+        <p>ClassVote permet d'organiser l'élection des délégués d'une classe : candidatures en binôme
+           (titulaire et remplaçant), vote anonyme, résultats. Le site est édité par Enzo Perdu et Emerick Woiret
+           (voir les <a href="#/mentions-legales">mentions légales</a>).</p>
+        <p>Ces conditions sont accessibles avant toute utilisation. Utiliser le site vaut acceptation
+           (articles 1103 et 1119 du Code civil). Si tu ne les acceptes pas, n'utilise pas le service.</p>
+
+        <h2>2. Rôles</h2>
+        <ul>
+            <li><b>Professeur</b> : crée un compte, ouvre une élection, valide les élèves si besoin, ouvre le vote, publie les résultats.</li>
+            <li><b>Élève</b> : entre le code à 6 chiffres, peut se porter candidat ou voter, sans compte.</li>
+        </ul>
+        <p>Le service est prévu pour un usage scolaire et il est gratuit. Les élèves mineurs l'utilisent
+           sous la responsabilité du professeur qui organise l'élection.</p>
+
+        <h2>3. Règles du vote</h2>
+        <ul>
+            <li>Chaque appareil dispose d'un seul bulletin par tour.</li>
+            <li>Le vote blanc et l'abstention sont possibles. Un bulletin validé est définitif.</li>
+            <li>Un binôme est élu à la majorité absolue des suffrages exprimés ; sinon un nouveau tour a lieu.</li>
+        </ul>
+
+        <h2>4. Comportement attendu</h2>
+        <p>Il est interdit :</p>
+        <ul>
+            <li>de saisir des contenus injurieux, discriminatoires, diffamatoires ou illicites (loi du 29 juillet 1881 sur la liberté de la presse) ;</li>
+            <li>d'usurper l'identité d'une autre personne (article 226-4-1 du Code pénal) ;</li>
+            <li>de voter plusieurs fois par des moyens détournés ;</li>
+            <li>de perturber le service, d'utiliser des outils automatisés ou de tenter d'accéder sans autorisation
+                au site ou à ses données : les articles 323-1 et suivants du Code pénal punissent l'accès frauduleux
+                à un système informatique et l'entrave à son fonctionnement.</li>
+        </ul>
+        <p>Ne saisis que les informations demandées. L'acte de candidature (noms, présentation) n'est lu que par le professeur.
+           Le professeur peut supprimer une élection ou une candidature.</p>
+
+        <h2>5. Compte professeur</h2>
+        <p>Le professeur fournit une adresse e-mail exacte, garde son mot de passe confidentiel et prévient les éditeurs
+           en cas d'utilisation non autorisée de son compte. Il est responsable des élections qu'il crée.
+           Il peut supprimer son compte à tout moment depuis « Mon compte » (suppression définitive de ses élections et données).</p>
+
+        <h2>6. Mineurs</h2>
+        <p>Les élèves votent sans compte et sans donner leur nom. Lorsqu'un service en ligne demande des données
+           à un mineur de moins de quinze ans, l'accord du titulaire de l'autorité parentale est requis
+           (article 45 de la loi du 6 janvier 1978). L'utilisation du site en classe s'inscrit dans l'activité
+           organisée par le professeur, qui veille à informer les élèves et, au besoin, leurs représentants légaux.</p>
+
+        <h2>7. Contenus des utilisateurs</h2>
+        <p>Les utilisateurs restent propriétaires de ce qu'ils saisissent et garantissent ne pas porter atteinte aux droits d'autrui.
+           Les éditeurs agissent en qualité d'hébergeur de ces contenus (article 6-I-2 de la LCEN) : ils ne les contrôlent pas
+           a priori, mais retirent promptement tout contenu manifestement illicite dont ils ont connaissance.</p>
+
+        <h2>8. Données personnelles</h2>
+        <p>Le traitement des données est décrit dans la <a href="#/confidentialite">politique de confidentialité</a>
+           et la page <a href="#/cookies">Cookies</a>.</p>
+
+        <h2>9. Propriété intellectuelle</h2>
+        <p>Le site, son code, son nom et son design appartiennent à leurs auteurs. Aucun droit n'est cédé aux utilisateurs,
+           qui disposent seulement d'un droit d'usage personnel, non exclusif et non transmissible.</p>
+
+        <h2>10. Responsabilité et disponibilité</h2>
+        <p>Le service est fourni « en l'état », sans garantie d'absence d'erreur ou d'interruption. Il peut être suspendu
+           pour maintenance ou en cas de force majeure (article 1218 du Code civil). Les résultats ont une valeur pédagogique ;
+           ils n'ont pas la valeur d'une élection officielle. Aucune clause des présentes ne limite la responsabilité des éditeurs
+           en cas de faute lourde ou dolosive, ni les droits d'ordre public des consommateurs.</p>
+
+        <h2>11. Suspension</h2>
+        <p>En cas de manquement à ces conditions, les éditeurs peuvent supprimer un contenu, une élection ou un compte,
+           sans préjudice d'éventuelles poursuites.</p>
+
+        <h2>12. Modification des conditions</h2>
+        <p>Les CGU peuvent évoluer ; la version en ligne fait foi, avec sa date de mise à jour.</p>
+
+        <h2>13. Droit applicable et contact</h2>
+        <p>Droit français. En cas de litige, une solution amiable est recherchée avant toute action devant les tribunaux français.
+           Contact : ${TODO("enzo.perdu@outlook.fr")}</p>`);
+}
+
+function viewPrivacy() {
+    return docHTML("Politique de confidentialité", `
+        <p class="muted small">Ce texte t'informe sur l'usage de tes données, conformément aux articles 12 à 14
+           du règlement (UE) 2016/679 (RGPD) et à la loi n° 78-17 du 6 janvier 1978 modifiée.</p>
+
+        <h2>1. Responsables du traitement</h2>
+        <p>Enzo Perdu et Emerick Woiret, éditeurs de ClassVote. Contact : ${TODO("enzo.perdu@outlook.fr")}.
+           Aucun délégué à la protection des données n'est désigné.</p>
+
+        <h2>2. Données, finalités et durées</h2>
+        <p>Seules les données nécessaires au fonctionnement de l'élection sont collectées (article 5 du RGPD).</p>
+        <div class="scroll"><table>
+            <tr><th>Personne</th><th>Données</th><th>Finalité et base légale</th><th>Durée</th></tr>
+            <tr><td>Professeur</td><td>Adresse e-mail, mot de passe (haché), élections créées</td><td>Gérer le compte et les élections. Exécution du service (art. 6.1.b)</td><td>Jusqu'à suppression du compte ; ${TODO("durée d'inactivité avant suppression")}</td></tr>
+            <tr><td>Élève</td><td>Identifiant technique anonyme de l'appareil, bulletin (sans nom), prénom ou pseudo si la validation est activée</td><td>Permettre un vote par appareil et garantir le secret du vote. Intérêt légitime (art. 6.1.f)</td><td>Supprimées avec l'élection</td></tr>
+            <tr><td>Candidat</td><td>Noms et prénoms du binôme, présentation, motivations, programme, slogan</td><td>Présenter les candidatures. Intérêt légitime (art. 6.1.f)</td><td>Acte de candidature supprimé à la clôture de l'élection ; le reste avec l'élection</td></tr>
+            <tr><td>Professeur</td><td>Procès-verbal (résultats, noms des élus, président et assesseurs)</td><td>Établir le procès-verbal. Exécution du service (art. 6.1.b)</td><td>Supprimé à la clôture de l'élection</td></tr>
+            <tr><td>Tous</td><td>Cookie de préférences (thème) et choix de consentement</td><td>Voir la page <a href="#/cookies">Cookies</a>. Consentement (art. 6.1.a) pour le thème</td><td>6 mois</td></tr>
+        </table></div>
+        <p>Les prénoms et le programme des candidats sont visibles par la classe ; l'acte complet n'est lu que par le professeur.
+           Les signatures dessinées à l'écran ne sont pas enregistrées : elles figurent uniquement dans le PDF que tu télécharges.
+           Aucune décision n'est prise de manière exclusivement automatisée (article 22 du RGPD), et aucune donnée n'est vendue.</p>
+
+        <h2>3. Destinataires</h2>
+        <ul>
+            <li>Le professeur qui organise l'élection, pour les données de sa classe.</li>
+            <li>Supabase, sous-traitant chargé de la base de données et de l'authentification (article 28 du RGPD).</li>
+            <li>L'hébergeur du site (voir les <a href="#/mentions-legales">mentions légales</a>).</li>
+            <li>Google (polices) et Cloudflare cdnjs (bibliothèques PDF et QR code) : ces services reçoivent ton adresse IP
+                lorsque ton navigateur charge ces ressources.</li>
+            <li>Les autorités, sur réquisition légale.</li>
+        </ul>
+
+        <h2>4. Transferts hors de l'Union européenne</h2>
+        <p>Certains prestataires peuvent traiter des données hors de l'Union européenne, notamment aux États-Unis.
+           Ces transferts sont encadrés par les articles 44 et suivants du RGPD (décision d'adéquation, dont le Data Privacy Framework,
+           ou clauses contractuelles types). ${TODO("région Supabase et garanties à confirmer")}</p>
+
+        <h2>5. Sécurité</h2>
+        <p>Les échanges sont chiffrés (HTTPS), les mots de passe sont hachés et l'accès aux données est restreint (article 32 du RGPD).
+           En cas de violation de données présentant un risque, les éditeurs préviennent la CNIL dans les 72 heures
+           (article 33) et les personnes concernées si le risque est élevé (article 34).</p>
+
+        <h2>6. Mineurs</h2>
+        <p>Les élèves peuvent voter sans donner leur nom. Les éditeurs ne demandent à un mineur de moins de quinze ans
+           aucune donnée allant au-delà de ce qui est nécessaire à l'élection, et l'accord d'un parent est requis
+           lorsque la loi l'exige (article 8 du RGPD, article 45 de la loi du 6 janvier 1978).
+           Un parent ou un élève peut demander la suppression d'une donnée à l'adresse de contact.</p>
+
+        <h2>7. Tes droits</h2>
+        <ul>
+            <li>accès (article 15), rectification (16) et effacement (17) ;</li>
+            <li>limitation (18) et opposition (21) du traitement ;</li>
+            <li>portabilité (20) des données fournies par le professeur ;</li>
+            <li>retrait du consentement à tout moment (article 7.3), sans effet sur ce qui a été fait avant ;</li>
+            <li>directives sur le sort de tes données après ton décès (article 85 de la loi de 1978).</li>
+        </ul>
+        <p>Écris à l'adresse de contact : une réponse t'est donnée sous un mois (article 12.3 du RGPD),
+           et une pièce d'identité peut être demandée en cas de doute sérieux.</p>
+
+        <h2>8. Réclamation</h2>
+        <p>Si tu estimes que tes droits ne sont pas respectés, tu peux saisir la CNIL, 3 place de Fontenoy,
+           TSA 80715, 75334 Paris Cedex 07 (<a href="https://www.cnil.fr/fr/plaintes" rel="noopener">cnil.fr/fr/plaintes</a>).</p>
+
+        <h2>9. Évolution du texte</h2>
+        <p>Cette politique peut changer ; la date de mise à jour figure en haut de la page.</p>`);
+}
+
+function viewCookies() {
+    return docHTML("Cookies", `
+        <p class="muted small">Cette page applique l'article 82 de la loi n° 78-17 du 6 janvier 1978
+           (qui transpose la directive 2002/58/CE) et les lignes directrices de la CNIL du 17 septembre 2020.</p>
+
+        <h2>Ce qui est stocké sur ton appareil</h2>
+        <div class="scroll"><table>
+            <tr><th>Nom</th><th>Rôle</th><th>Durée</th><th>Consentement</th></tr>
+            <tr><td>Session (sb-…-auth-token)</td><td>Te reconnaître : session anonyme de l'élève ou connexion du professeur</td><td>Jusqu'à déconnexion</td><td>Non requis (essentiel)</td></tr>
+            <tr><td>cv_consent</td><td>Retenir ton choix sur les cookies</td><td>6 mois</td><td>Non requis (essentiel)</td></tr>
+            <tr><td>cv_theme</td><td>Retenir ton thème clair ou sombre</td><td>6 mois</td><td>Oui (préférences)</td></tr>
+            <tr><td>approved:… (professeur)</td><td>Repérer les doublons d'élèves, uniquement sur l'appareil du professeur</td><td>Jusqu'à effacement</td><td>Non requis (essentiel)</td></tr>
+        </table></div>
+        <p>Aucun cookie publicitaire, aucun outil de mesure d'audience, aucun suivi entre sites.</p>
+
+        <h2>Ton choix</h2>
+        <p>Les éléments essentiels sont nécessaires au service que tu demandes : ils ne demandent pas ton accord.
+           Les autres ne sont déposés qu'avec ton consentement. Refuser est aussi simple qu'accepter,
+           continuer à naviguer ne vaut pas accord, et ton choix est conservé 6 mois avant de t'être redemandé.
+           Tu peux le modifier ou le retirer à tout moment.</p>
+        <div class="row"><button onclick="showConsent(true)">Modifier mes choix</button></div>
+
+        <h2>Depuis ton navigateur</h2>
+        <p>Tu peux aussi bloquer ou effacer les cookies dans les réglages de ton navigateur. Sans les éléments essentiels,
+           la connexion et le vote ne fonctionneront plus.</p>
+
+        <h2>Pour aller plus loin</h2>
+        <p>Les données personnelles liées au service sont décrites dans la <a href="#/confidentialite">politique de confidentialité</a>.
+           Informations de la CNIL : <a href="https://www.cnil.fr/fr/cookies-et-traceurs-que-dit-la-loi" rel="noopener">cnil.fr/cookies</a>.</p>`);
+}
+
+function viewNotFound() {
+    return `
+        <section class="nf doc">
+            <div class="num" aria-hidden="true">404</div>
+            <span class="stamp">Bulletin nul</span>
+            <h1>Page introuvable</h1>
+            <p class="muted">Cette page n'existe pas ou a été déplacée.</p>
+            <button class="go" onclick="closePage()">Retour à l'accueil</button>
+        </section>`;
+}
+
+Object.assign(VIEWS, {
+    legal:   viewLegal,
+    cgu:     viewCgu,
+    privacy: viewPrivacy,
+    cookies: viewCookies,
+    nf:      viewNotFound
+});
+
+
+/* --- 8.5 Routage des pages légales (#/cgu, #/cookies…) ----------------- */
+
+function pageFromHash() {
+    if (!location.hash.startsWith("#/")) {
+        return null;
+    }
+
+    const slug = location.hash.slice(2);
+    return Object.keys(SLUGS).find(k => SLUGS[k] === slug) || "nf";
+}
+
+function syncHash() {
+    const page = pageFromHash();
+
+    if (page) {
+        if (!STATIC_VIEWS.includes(view)) {
+            backView = view;
+        }
+        view = page;
+        render();
+        window.scrollTo(0, 0);
+    } else if (STATIC_VIEWS.includes(view)) {
+        go(backView);
+    }
+}
+
+function closePage() {
+    go(backView === "nf" ? "home" : backView);
+}
+
+function setTitle() {
+    document.title = PAGE_TITLES[view]
+        ? PAGE_TITLES[view] + " · ClassVote"
+        : "Élection des délégués";
+}
+
+window.addEventListener("hashchange", syncHash);
+window.addEventListener("popstate", syncHash);
+
+if (!readCookie(CONSENT_KEY)) {
+    showConsent(false);
+}
+
+
+/* ==========================================================================
+   9. DÉMARRAGE Emerick
+   ========================================================================== */
+
+(async () => {
+    const linkCode = codeFromLink();
+
+    try {
+        const user = await api.session();
+        me = user.id;
+
+        /* Lien de réinitialisation expiré ou déjà utilisé */
+        if (AUTH_LINK_ERROR) {
+            history.replaceState(null, "", location.pathname + location.search);
+            prof = user.is_anonymous ? null : user.id;
+            return go(prof ? "dash" : "plogin",
+                "Ce lien a expiré ou a déjà été utilisé : redemande un e-mail de réinitialisation.");
+        }
+
+        /* Un professeur déjà connecté retrouve directement son tableau de bord */
+        if (!user.is_anonymous) {
+            prof = user.id;
+
+            /* Il arrive depuis le lien de l'e-mail « mot de passe oublié » */
+            if (recovering) {
+                view = "reset";
+                return render();
+            }
+
+            if (pageFromHash()) {
+                view = "dash";
+                return syncHash();
+            }
+
+            return go("dash");
+        }
+
+        if (linkCode && !pageFromHash()) {
+            return joinFromLink(linkCode);
+        }
+    } catch (e) {
+        /* Aucun message ici : l'élève n'a encore rien fait.
+           La session sera retentée (ensureMe) à sa première action. */
+        console.warn("Session non établie au démarrage :", e);
+    }
+
+    if (pageFromHash()) {
+        syncHash();
+    } else if (linkCode) {
+        joinFromLink(linkCode);
+    } else {
+        render();
+    }
+})();
